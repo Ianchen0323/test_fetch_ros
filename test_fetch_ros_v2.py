@@ -671,7 +671,13 @@ class SpotFetchROS2Node(Node):
         x = math.fabs(max_x - min_x) / 2.0 + min_x
         y = math.fabs(max_y - min_y) / 2.0 + min_y
         return (x, y)
-
+    # ---------------------------------------------------------
+    #status 函數
+    # ---------------------------------------------------------
+    def clear_tracking_status(self):
+        for target in self.target_list:
+            if target["status"] == "tracking":
+                target["status"] = "pending"
 
 def main(args=None):
     rclpy.init(args=args)
