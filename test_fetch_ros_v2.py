@@ -23,8 +23,12 @@ import threading
 import time
 
 # ros2
+import tf2_ros
+from geometry_msgs.msg import PoseStamped
+from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from visualization_msgs.msg import Marker, MarkerArray
+
 
 
 class SpotFetchROS2Node(Node):
@@ -83,6 +87,10 @@ class SpotFetchROS2Node(Node):
         # ----------------------- RViz publisher ---------------------------------------
         self.marker_pub = self.create_publisher(MarkerArray, 'detected_target_markers', 10)
 
+        # ----------------------- TF ---------------------------------------
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
     def nav_callback(self, msg):
         """
         核心邏輯：如果沒在夾東西，就把導航的速度直接『搬運』給 Spot。
@@ -122,13 +130,7 @@ class SpotFetchROS2Node(Node):
             return
 
         # 5. 從 target_list 中找最近目標
-        nearest_target, nearest_distance = self.find_nearest_target()
-
-        if nearest_target is None:
-            if self.is_approaching:
-                self.get_logger().info("找不到有效最近目標，恢復巡邏模式...")
-                self.is_approaching = False
-            return
+        nearest_target, nearest_pose_in_body, nearest_distance = self.find_nearest_target()
 
         self.get_logger().info(
             f"目前最近目標: {nearest_target['id']}，距離: {nearest_distance:.2f}m"
@@ -137,18 +139,15 @@ class SpotFetchROS2Node(Node):
         # 6. 若最近目標還大於 1.5m，就接近最近目標
         if nearest_distance > 1.5:
             self.is_approaching = True
+            
+            tx = nearest_pose_in_body.pose.position.x
+            ty = nearest_pose_in_body.pose.position.y
+            angle_to_target = math.atan2(ty, tx)
 
-            vision_tform_obj = nearest_target["vision_tform_obj"]
-
-            try:
-                tx = vision_tform_obj.x
-                ty = vision_tform_obj.y
-                angle_to_target = math.atan2(ty, tx)
-            except Exception as e:
-                self.get_logger().error(f"最近目標角度計算失敗: {e}")
-                return
-
-            self.get_logger().info(f"接近最近目標中... (距離 {nearest_distance:.2f}m)")
+            self.get_logger().info(
+                f"目前最近目標: {nearest_target['id']}，"
+                f"body x={tx:.2f}, y={ty:.2f}, 距離={nearest_distance:.2f}m"
+            )
 
             self.move_msg.linear.x = 0.3
             self.move_msg.angular.z = angle_to_target * 0.5
@@ -500,35 +499,58 @@ class SpotFetchROS2Node(Node):
                     "vision_tform_obj": detected["vision_tform_obj"],
                 })
     # ---------------------------------------------------------
-    # 搜尋全局 target_list 中最近的目標
+    # 搜尋全局 target_list 中最近的目標 有問題
     # ---------------------------------------------------------
     def find_nearest_target(self):
         if len(self.target_list) == 0:
-            return None, None
+            return None, None, None
 
         nearest_target = None
+        nearest_pose_in_body = None
         nearest_distance = math.inf
 
         for target in self.target_list:
             tform = target["vision_tform_obj"]
 
             try:
-                distance = math.sqrt(
-                    float(tform.x) * float(tform.x) +
-                    float(tform.y) * float(tform.y) +
-                    float(tform.z) * float(tform.z)
+                pose_in_vision = PoseStamped()
+                pose_in_vision.header.stamp = self.get_clock().now().to_msg()
+                pose_in_vision.header.frame_id = frame_helpers.VISION_FRAME_NAME
+
+                pose_in_vision.pose.position.x = float(tform.x)
+                pose_in_vision.pose.position.y = float(tform.y)
+                pose_in_vision.pose.position.z = float(tform.z)
+
+                pose_in_vision.pose.orientation.x = 0.0
+                pose_in_vision.pose.orientation.y = 0.0
+                pose_in_vision.pose.orientation.z = 0.0
+                pose_in_vision.pose.orientation.w = 1.0
+
+                pose_in_body = self.tf_buffer.transform(
+                    pose_in_vision,
+                    frame_helpers.BODY_FRAME_NAME,
+                    timeout=Duration(seconds=0.2)
                 )
-            except Exception:
+
+                x = pose_in_body.pose.position.x
+                y = pose_in_body.pose.position.y
+
+                # 只算平面距離
+                distance = math.sqrt(x * x + y * y)
+
+            except Exception as e:
+                self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
                 continue
 
             if distance < nearest_distance:
                 nearest_distance = distance
                 nearest_target = target
+                nearest_pose_in_body = pose_in_body
 
         if nearest_target is None:
-            return None, None
+            return None, None, None
 
-        return nearest_target, nearest_distance
+        return nearest_target, nearest_pose_in_body, nearest_distance
     # ---------------------------------------------------------
     # 發布 RViz marker
     # ---------------------------------------------------------
