@@ -3,8 +3,8 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 
 import math
-import cv2
-import numpy as np
+# import cv2
+# import numpy as np
 from google.protobuf import wrappers_pb2
 
 # Boston Dynamics SDK (僅用於視覺與資料處理，不搶 Lease)
@@ -55,7 +55,7 @@ class SpotFetchROS2Node(Node):
         self.min_confidence = 0.5
 
         # 去重門檻：5 cm
-        self.duplicate_threshold = 0.05
+        self.duplicate_threshold = 0.5
         
         # 啟動主迴圈計時器
         self.timer = self.create_timer(0.5, self.fetch_loop)
@@ -314,11 +314,18 @@ class SpotFetchROS2Node(Node):
             self.is_fetching = False
 
     # ---------------------------------------------------------
-    # 單目標夾取用函式
+    # 單目標夾取用函式(只處理1.5m內的目標並且回傳最近的的目標)
     # ---------------------------------------------------------
     def get_obj_and_img(self, image_sources):
+        best_obj = None
+        best_image_response = None
+        best_vision_tform_obj = None
+        nearest_distance = math.inf
+
         for source in image_sources:
-            img_src = network_compute_bridge_pb2.ImageSourceAndService(image_source=source)
+            img_src = network_compute_bridge_pb2.ImageSourceAndService(
+                image_source=source
+            )
             input_data = network_compute_bridge_pb2.NetworkComputeInputData(
                 image_source_and_service=img_src,
                 model_name=self.model_name,
@@ -336,39 +343,58 @@ class SpotFetchROS2Node(Node):
             try:
                 resp = self.ncb_client.network_compute_bridge_command(process_img_req)
             except Exception as e:
-                self.get_logger().error(f'NCS 連線錯誤: {e}')
-                return None, None, None
+                self.get_logger().error(f'NCS 連線錯誤 ({source}): {e}')
+                continue
 
-            best_obj = None
-            highest_conf = 0.0
-            best_vision_tform_obj = None
+            if len(resp.object_in_image) == 0:
+                continue
 
-            if len(resp.object_in_image) > 0:
-                for obj in resp.object_in_image:
-                    obj_label = obj.name.split('_label_')[-1]
-                    if obj_label != self.target_label:
-                        continue
-                        
-                    conf_msg = wrappers_pb2.FloatValue()
-                    obj.additional_properties.Unpack(conf_msg)
-                    conf = conf_msg.value
+            for obj in resp.object_in_image:
+                obj_label = obj.name.split('_label_')[-1]
+                if obj_label != self.target_label:
+                    continue
 
-                    try:
-                        vision_tform_obj = frame_helpers.get_a_tform_b(
-                            obj.transforms_snapshot,
-                            frame_helpers.VISION_FRAME_NAME,
-                            obj.image_properties.frame_name_image_coordinates
-                        )
-                    except Exception:
-                        vision_tform_obj = None
+                try:
+                    vision_tform_obj = frame_helpers.get_a_tform_b(
+                        obj.transforms_snapshot,
+                        frame_helpers.VISION_FRAME_NAME,
+                        obj.image_properties.frame_name_image_coordinates
+                    )
+                except Exception:
+                    vision_tform_obj = None
 
-                    if conf > highest_conf and vision_tform_obj is not None:
-                        highest_conf = conf
-                        best_obj = obj
-                        best_vision_tform_obj = vision_tform_obj
+                if vision_tform_obj is None:
+                    continue
 
-            if best_obj is not None:
-                return best_obj, resp.image_response, best_vision_tform_obj
+                try:
+                    vision_tform_body = frame_helpers.get_a_tform_b(
+                        resp.image_response.shot.transforms_snapshot,
+                        frame_helpers.VISION_FRAME_NAME,
+                        frame_helpers.BODY_FRAME_NAME
+                    )
+
+                    body_tform_obj = vision_tform_body.inverse() * vision_tform_obj
+
+                    tx = body_tform_obj.x
+                    ty = body_tform_obj.y
+                    distance = math.sqrt(tx ** 2 + ty ** 2)
+                except Exception as e:
+                    self.get_logger().warn(f'距離計算失敗 ({source}): {e}')
+                    continue
+
+                # 只處理 1.5m 內的目標
+                if distance > 1.5:
+                    continue
+
+                # 取最近的目標回傳
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    best_obj = obj
+                    best_image_response = resp.image_response
+                    best_vision_tform_obj = vision_tform_obj
+
+        if best_obj is not None:
+            return best_obj, best_image_response, best_vision_tform_obj
 
         return None, None, None
 
