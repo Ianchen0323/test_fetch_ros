@@ -24,6 +24,7 @@ import time
 
 # ros2
 import tf2_ros
+import tf2_geometry_msgs
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
@@ -156,8 +157,26 @@ class SpotFetchROS2Node(Node):
                 f"body x={tx:.2f}, y={ty:.2f}, 距離={nearest_distance:.2f}m"
             )
 
-            self.move_msg.linear.x = 0.3
-            self.move_msg.angular.z = angle_to_target * 0.5
+
+            self.move_msg = Twist()
+
+            # 角度很大：先以轉向為主，避免目標在後方時還一直往前
+            if abs(angle_to_target) > 1.2:
+                self.move_msg.linear.x = 0.0
+                self.move_msg.angular.z = angle_to_target * 0.6
+
+            # 中等角度：慢速前進，邊轉邊走
+            elif abs(angle_to_target) > 0.5:
+                self.move_msg.linear.x = 0.12
+                self.move_msg.angular.z = angle_to_target * 0.6
+
+            # 小角度：正常靠近
+            else:
+                self.move_msg.linear.x = 0.3
+                self.move_msg.angular.z = angle_to_target * 0.5
+
+            self.cmd_vel_pub.publish(self.move_msg)
+
             return
 
         # 7. 若最近目標小於等於 1.5m，進入夾取模式
