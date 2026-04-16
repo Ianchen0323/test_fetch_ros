@@ -59,7 +59,7 @@ class SpotFetchROS2Node(Node):
         self.min_confidence = 0.5
 
         # 去重門檻：5 cm
-        self.duplicate_threshold = 0.5
+        self.duplicate_threshold = 0.05
         
         # 啟動主迴圈計時器
         self.timer = self.create_timer(0.5, self.fetch_loop)
@@ -132,6 +132,13 @@ class SpotFetchROS2Node(Node):
         # 5. 從 target_list 中找最近目標
         nearest_target, nearest_pose_in_body, nearest_distance = self.find_nearest_target()
 
+        #防止TF轉換失敗回傳 None 的情況導致後續程式崩潰
+        if nearest_target is None or nearest_pose_in_body is None or nearest_distance is None:
+            if self.is_approaching:
+                self.get_logger().info("找不到有效最近目標，恢復巡邏模式...")
+                self.is_approaching = False
+            return
+        
         self.get_logger().info(
             f"目前最近目標: {nearest_target['id']}，距離: {nearest_distance:.2f}m"
         )
@@ -139,7 +146,7 @@ class SpotFetchROS2Node(Node):
         # 6. 若最近目標還大於 1.5m，就接近最近目標
         if nearest_distance > 1.5:
             self.is_approaching = True
-            
+
             tx = nearest_pose_in_body.pose.position.x
             ty = nearest_pose_in_body.pose.position.y
             angle_to_target = math.atan2(ty, tx)
