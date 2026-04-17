@@ -30,6 +30,8 @@ from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from visualization_msgs.msg import Marker, MarkerArray
 
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+
 # ----------------------- status 定義 -------------------------------------------
 STATUS_DETECTED    = "detected"
 STATUS_PENDING     = "pending"
@@ -67,17 +69,33 @@ class SpotFetchROS2Node(Node):
         self.min_confidence = 0.5
 
         # 去重門檻：5 cm
-        self.duplicate_threshold = 0.05
+        self.duplicate_threshold = 0.2
         
         # 啟動主迴圈計時器
-        self.timer = self.create_timer(0.5, self.fetch_loop)
         self.is_fetching = False
         self.is_approaching = False
         self.move_msg = Twist()
 
-        # ----------------------- walk --------------------------------------------------
-        # 訂閱 nav 速度指令
-        self.nav_sub = self.create_subscription(Twist, 'cmd_vel_nav', self.nav_callback, 10)
+        # 建立一個並行群組
+        self.nav_group = ReentrantCallbackGroup()
+        self.timer_group = MutuallyExclusiveCallbackGroup()
+        
+        # ----------------------- communication --------------------------------------------------
+        
+        # 1. 導航訂閱：使用並行群組
+        self.nav_sub = self.create_subscription(
+            Twist, 'cmd_vel_nav', self.nav_callback, 10,
+            callback_group=self.nav_group
+        )
+        
+        # 2. NCS 偵測計時器：使用並行群組
+        self.timer = self.create_timer(
+            0.1, self.fetch_loop,
+            callback_group=self.timer_group
+        )
+        
+        # # 訂閱 nav 速度指令
+        # self.nav_sub = self.create_subscription(Twist, 'cmd_vel_nav', self.nav_callback, 10)
         # 發布最終給 Spot 的控制速度
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
@@ -205,9 +223,6 @@ class SpotFetchROS2Node(Node):
         self.is_fetching = True
         self.current_grasp_target_id = best_target_id
 
-        stop_msg = Twist()
-        self.cmd_vel_pub.publish(stop_msg)
-
         # 計算像素中心
         center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
 
@@ -229,6 +244,13 @@ class SpotFetchROS2Node(Node):
         # --- 將 SDK 夾取指令轉換並傳送給 ROS 2 ---
         self.send_ros2_manipulation_goal(manip_request)
 
+    def send_cmd_async(self, sdk_cmd, label):
+        """非同步發送：發完指令就直接回傳，不等待結果"""
+        goal_msg = RobotCommand.Goal()
+        convert(sdk_cmd, goal_msg.command)
+        self.get_logger().info(f'發布指令: {label}')
+        self.robot_client.send_goal_async(goal_msg) # 不加 callback，不等待
+    
     def send_cmd_blocking(self, sdk_cmd, label):
         """同步阻塞式發送：確保前一個動作完成才回傳"""
         if not self.robot_client.wait_for_server(timeout_sec=5.0):
@@ -317,25 +339,31 @@ class SpotFetchROS2Node(Node):
         self.send_cmd_blocking(RobotCommandBuilder.arm_ready_command(), "手臂預備 (Ready)")
         
         try:
-            poses = [
-                (0.25, 0.2, 0.6, "安全點 1: 側上方"),
-                (0.0, 0.0, 0.7, "安全點 2: 正上方"),
-                (-0.2, 0.0, 0.6, "安全點 3: 背部後方")
-            ]
-
-            for x, y, z, label in poses:
-                cmd = RobotCommandBuilder.arm_pose_command(
-                    x, y, z, 0.707, 0, 0.707, 0,
-                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME,
-                    seconds=1.5
-                )
-                self.send_cmd_blocking(cmd, label)
-
+            final_joints = [3.103, -1.219, 0.732, 0.013, 1.826, 2.877]
+            
+            # --- 步驟 1: 高位轉向後方 ---
+            # 我們保留 sh0 (3.103)，但將 sh1 設為較高的角度 (例如 -0.5 或 -0.8)
+            # 這樣手臂會「舉著」轉到後面，不會掃到背上的設備
+            high_rotate_joints = [2.38, -1.719, 0.8, 0.0, 1.826, 2.877] 
+            
+            self.get_logger().info("執行步驟 1: 高位旋轉至後方...")
+            cmd1 = RobotCommandBuilder.arm_joint_command(*high_rotate_joints)
+            # self.send_cmd_blocking(cmd1, "高位旋轉")
+            self.send_cmd_async(cmd1, "高位旋轉")
+            time.sleep(0.9)
+            # --- 步驟 2: 下壓至最終目標點 ---
+            # 此時第一軸已經到位，垂直降落即可
+            self.get_logger().info("執行步驟 2: 下壓至背後安全點...")
+            cmd2 = RobotCommandBuilder.arm_joint_command(*final_joints, max_vel=20.0, 
+                max_accel=5.0)
+            self.send_cmd_blocking(cmd2, "垂直下壓到位")
+            
+            
             self.send_cmd_blocking(
                 RobotCommandBuilder.claw_gripper_open_fraction_command(1.0),
                 "開啟夾爪"
             )
-            time.sleep(1.0)
+            time.sleep(0.7)
 
             self.send_cmd_blocking(
                 RobotCommandBuilder.arm_stow_command(),
@@ -346,7 +374,7 @@ class SpotFetchROS2Node(Node):
                 RobotCommandBuilder.claw_gripper_open_fraction_command(0.0),
                 "關閉夾爪"
             )
-            time.sleep(1.0)
+            time.sleep(0.2)
             
         except Exception as e:
             self.get_logger().error(f"執行回收動作時出錯: {e}")
@@ -785,7 +813,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = SpotFetchROS2Node()
     
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     
     try:
