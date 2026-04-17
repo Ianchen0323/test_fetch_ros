@@ -3,8 +3,6 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 
 import math
-# import cv2
-# import numpy as np
 from google.protobuf import wrappers_pb2
 
 # Boston Dynamics SDK (僅用於視覺與資料處理，不搶 Lease)
@@ -24,7 +22,6 @@ import time
 
 # ros2
 import tf2_ros
-import tf2_geometry_msgs
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
@@ -99,10 +96,6 @@ class SpotFetchROS2Node(Node):
         # 發布最終給 Spot 的控制速度
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        # 狀態變數
-        self.current_vx = 0.0
-        self.current_vy = 0.0
-        self.current_vrot = 0.0
 
         # ----------------------- detection / target list -------------------------------
         self.detection_round = 0
@@ -111,8 +104,6 @@ class SpotFetchROS2Node(Node):
         self.next_target_id = 0
         self.current_grasp_target_id = None
 
-        # ----------------------- RViz publisher ---------------------------------------
-        self.marker_pub = self.create_publisher(MarkerArray, 'detected_target_markers', 10)
 
         # ----------------------- TF ---------------------------------------------------
         self.tf_buffer = tf2_ros.Buffer()
@@ -136,58 +127,117 @@ class SpotFetchROS2Node(Node):
     def fetch_loop(self):
         if self.is_fetching:
             return
-        
+
         self.get_logger().info('正在透過 NCS 搜尋物體...')
 
-        # 1. 掃描所有看到的目標
-        self.detection_obj_and_img(
+        # 1. 掃描所有看到的目標，並在函式內完成：
+        #    merge_detected_targets() + update_target_status()
+        target_obj, image_full, vision_tform_obj, target_id = self.detection_obj_and_img(
             ['frontleft_fisheye_image', 'frontright_fisheye_image']
         )
 
-        # 2. 更新全局 target_list（5 cm 去重）
-        self.update_target_list()
-
-        # 3. 發布到 RViz
-        self.publish_target_markers()
-
-        # 4. 若沒有任何目標，恢復巡邏 (走coverage_path)
+        # 2. 若沒有任何目標，恢復巡邏
         if len(self.target_list) == 0:
             if self.is_approaching:
                 self.get_logger().info("target_list 為空，恢復巡邏模式...")
                 self.is_approaching = False
             return
 
-        # 5. 從 target_list 中找最近目標
-        nearest_target, nearest_pose_in_body, nearest_distance = self.find_nearest_target()
+        # 3. 若 target_id 非 None，代表已有 pending 目標，可優先進入夾取
+        if target_id is not None:
+            self.get_logger().info("已有 pending 目標，開始進入夾取模式...")
+            self.is_approaching = False
 
-        #防止TF轉換失敗回傳 None 的情況導致後續程式崩潰
-        if nearest_target is None or nearest_pose_in_body is None or nearest_distance is None:
-            if self.is_approaching:
-                self.get_logger().info("找不到有效最近目標，恢復巡邏模式...")
-                self.is_approaching = False
+            if target_obj is None or vision_tform_obj is None:
+                self.get_logger().warn("進入夾取模式，但 detection_obj_and_img() 沒有取得有效目標")
+                return
+
+            self.get_logger().info("已抵達目標範圍，開始夾取程序...")
+            self.is_fetching = True
+            self.current_grasp_target_id = target_id
+
+            # 計算像素中心
+            center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
+
+            # 構造 SDK 夾取指令
+            pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
+            grasp = manipulation_api_pb2.PickObjectInImage(
+                pixel_xy=pick_vec,
+                transforms_snapshot_for_camera=image_full.shot.transforms_snapshot,
+                frame_name_image_sensor=image_full.shot.frame_name_image_sensor,
+                camera_model=image_full.source.pinhole
+            )
+            grasp.grasp_params.grasp_palm_to_fingertip = 0.6
+            grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+
+            manip_request = manipulation_api_pb2.ManipulationApiRequest(
+                pick_object_in_image=grasp
+            )
+
+            # --- 將 SDK 夾取指令轉換並傳送給 ROS 2 ---
+            self.send_ros2_manipulation_goal(manip_request)
             return
-        
-        self.get_logger().info(
-            f"目前最近目標: {nearest_target['id']}，距離: {nearest_distance:.2f}m"
-        )
 
-        # 6. 若最近目標還大於 1.5m，就接近最近目標
-        if nearest_distance > 1.5:
+        # 4. 若沒有 pending，再找目前 target_list 中是否有 approaching 目標
+        approaching_target = None
+        approaching_pose_in_body = None
+        approaching_distance = None
+
+        for target in self.target_list:
+            if target.get("status") != STATUS_APPROACHING:
+                continue
+
+            tform = target["vision_tform_obj"]
+
+            try:
+                pose_in_vision = PoseStamped()
+                pose_in_vision.header.stamp = self.get_clock().now().to_msg()
+                pose_in_vision.header.frame_id = frame_helpers.VISION_FRAME_NAME
+
+                pose_in_vision.pose.position.x = float(tform.x)
+                pose_in_vision.pose.position.y = float(tform.y)
+                pose_in_vision.pose.position.z = float(tform.z)
+
+                pose_in_vision.pose.orientation.x = 0.0
+                pose_in_vision.pose.orientation.y = 0.0
+                pose_in_vision.pose.orientation.z = 0.0
+                pose_in_vision.pose.orientation.w = 1.0
+
+                pose_in_body = self.tf_buffer.transform(
+                    pose_in_vision,
+                    frame_helpers.BODY_FRAME_NAME,
+                    timeout=Duration(seconds=0.2)
+                )
+
+                x = pose_in_body.pose.position.x
+                y = pose_in_body.pose.position.y
+                distance = math.sqrt(x * x + y * y)
+
+            except Exception as e:
+                self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
+                continue
+
+            approaching_target = target
+            approaching_pose_in_body = pose_in_body
+            approaching_distance = distance
+            break
+
+        # 5. 若有 approaching，執行接近
+        if approaching_target is not None:
             self.is_approaching = True
 
-            tx = nearest_pose_in_body.pose.position.x
-            ty = nearest_pose_in_body.pose.position.y
+            tx = approaching_pose_in_body.pose.position.x
+            ty = approaching_pose_in_body.pose.position.y
             angle_to_target = math.atan2(ty, tx)
 
             self.get_logger().info(
-                f"目前最近目標: {nearest_target['id']}，"
-                f"body x={tx:.2f}, y={ty:.2f}, 距離={nearest_distance:.2f}m"
+                f"目前接近目標: {approaching_target['id']}，"
+                f"body x={tx:.2f}, y={ty:.2f}, 距離={approaching_distance:.2f}m"
             )
-
 
             self.move_msg = Twist()
 
-            # 角度很大：先以轉向為主，避免目標在後方時還一直往前
+            # 角度很大：先以轉向為主
             if abs(angle_to_target) > 1.2:
                 self.move_msg.linear.x = 0.0
                 self.move_msg.angular.z = angle_to_target * 0.6
@@ -203,46 +253,12 @@ class SpotFetchROS2Node(Node):
                 self.move_msg.angular.z = angle_to_target * 0.5
 
             self.cmd_vel_pub.publish(self.move_msg)
-
             return
 
-        # 7. 若最近目標小於等於 1.5m，進入夾取模式
-        self.get_logger().info("最近目標已進入 1.5m 範圍，開始進入夾取模式...")
-        self.is_approaching = False
-
-        target_obj, image_full, vision_tform_obj, best_target_id = self.get_obj_and_img(
-            ['frontleft_fisheye_image', 'frontright_fisheye_image']
-        )
-
-        if target_obj is None or vision_tform_obj is None:
-            self.get_logger().warn("進入夾取模式，但 get_obj_and_img() 沒有取得有效目標")
-            return
-
-
-        self.get_logger().info("已抵達目標範圍，開始夾取程序...")
-        self.is_fetching = True
-        self.current_grasp_target_id = best_target_id
-
-        # 計算像素中心
-        center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
-
-        # 構造 SDK 夾取指令
-        pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
-        grasp = manipulation_api_pb2.PickObjectInImage(
-            pixel_xy=pick_vec,
-            transforms_snapshot_for_camera=image_full.shot.transforms_snapshot,
-            frame_name_image_sensor=image_full.shot.frame_name_image_sensor,
-            camera_model=image_full.source.pinhole
-        )
-        grasp.grasp_params.grasp_palm_to_fingertip = 0.6
-        grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
-
-        manip_request = manipulation_api_pb2.ManipulationApiRequest(
-            pick_object_in_image=grasp
-        )
-
-        # --- 將 SDK 夾取指令轉換並傳送給 ROS 2 ---
-        self.send_ros2_manipulation_goal(manip_request)
+        # 6. 其餘情況：沒有 approaching，也沒有 pending 可抓，恢復巡邏
+        if self.is_approaching:
+            self.get_logger().info("目前沒有 approaching / pending 目標，恢復巡邏模式...")
+            self.is_approaching = False
 
     def send_cmd_async(self, sdk_cmd, label):
         """非同步發送：發完指令就直接回傳，不等待結果"""
@@ -383,14 +399,22 @@ class SpotFetchROS2Node(Node):
             self.current_grasp_target_id = None
 
     # ---------------------------------------------------------
-    # 單目標夾取用函式(只處理1.5m內的目標並且回傳最近的的目標)
+    # 
     # ---------------------------------------------------------
-    def get_obj_and_img(self, image_sources):
+    def detection_obj_and_img(self, image_sources):
+        # 每輪清單初始化
+        self.detection_round += 1
+        round_id = self.detection_round
+
+        self.detected_objects = []
+        obj_index_in_round = 0
+
         best_obj = None
         best_image_response = None
         best_vision_tform_obj = None
-        nearest_distance = math.inf
         best_target_id = None
+        best_detected = None
+        nearest_distance = math.inf
 
         for source in image_sources:
             img_src = network_compute_bridge_pb2.ImageSourceAndService(
@@ -431,9 +455,6 @@ class SpotFetchROS2Node(Node):
                         obj.image_properties.frame_name_image_coordinates
                     )
                 except Exception:
-                    vision_tform_obj = None
-
-                if vision_tform_obj is None:
                     continue
 
                 try:
@@ -444,7 +465,6 @@ class SpotFetchROS2Node(Node):
                     )
 
                     body_tform_obj = vision_tform_body.inverse() * vision_tform_obj
-
                     tx = body_tform_obj.x
                     ty = body_tform_obj.y
                     distance = math.sqrt(tx ** 2 + ty ** 2)
@@ -452,108 +472,48 @@ class SpotFetchROS2Node(Node):
                     self.get_logger().warn(f'距離計算失敗 ({source}): {e}')
                     continue
 
-                if distance > 1.5:
-                    continue
-
-                close_detected = [{
-                    "obj": obj,
-                    "vision_tform_obj": vision_tform_obj,
-                    "status": STATUS_PENDING
-                }]
-
-                updated_targets = self.update_target_list(
-                    detected_objects=close_detected,
-                    new_status=STATUS_PENDING
-                )
-
-                if len(updated_targets) > 0:
-                    target = updated_targets[0]
-
-                    if distance < nearest_distance:
-                        nearest_distance = distance
-                        best_obj = obj
-                        best_image_response = resp.image_response
-                        best_vision_tform_obj = vision_tform_obj
-                        best_target_id = target["id"]
-
-        if best_obj is None:
-            return None, None, None, None
-
-        return best_obj, best_image_response, best_vision_tform_obj, best_target_id
-
-    # ---------------------------------------------------------
-    # 多目標掃描函式
-    # ---------------------------------------------------------
-    def detection_obj_and_img(self, image_sources):
-        # 每輪清單初始化
-        self.detection_round += 1
-        round_id = self.detection_round
-
-        # 清空本輪候選物件
-        self.detected_objects = []
-
-        # 同一輪內的物件編號
-        obj_index_in_round = 0
-
-        for source in image_sources:
-            img_src = network_compute_bridge_pb2.ImageSourceAndService(
-                image_source=source
-            )
-            input_data = network_compute_bridge_pb2.NetworkComputeInputData(
-                image_source_and_service=img_src,
-                model_name=self.model_name,
-                min_confidence=self.min_confidence,
-                rotate_image=network_compute_bridge_pb2.NetworkComputeInputData.ROTATE_IMAGE_ALIGN_HORIZONTAL
-            )
-            server_data = network_compute_bridge_pb2.NetworkComputeServerConfiguration(
-                service_name=self.ml_service
-            )
-            process_img_req = network_compute_bridge_pb2.NetworkComputeRequest(
-                input_data=input_data,
-                server_config=server_data
-            )
-
-            try:
-                resp = self.ncb_client.network_compute_bridge_command(process_img_req)
-            except Exception as e:
-                self.get_logger().error(f'NCS 連線錯誤 ({source}): {e}')
-                continue
-
-            if len(resp.object_in_image) == 0:
-                continue
-
-            for obj in resp.object_in_image:
-                obj_label = obj.name.split('_label_')[-1]
-                if obj_label != self.target_label:
-                    continue
-
-                try:
-                    vision_tform_obj = frame_helpers.get_a_tform_b(
-                        obj.transforms_snapshot,
-                        frame_helpers.VISION_FRAME_NAME,
-                        obj.image_properties.frame_name_image_coordinates
-                    )
-                except Exception:
-                    vision_tform_obj = None
-
-                if vision_tform_obj is None:
-                    continue
-
                 suffix = chr(ord('a') + obj_index_in_round)
                 obj_id = f"{round_id}{suffix}"
                 obj_index_in_round += 1
 
-                self.detected_objects.append({
+                detected = {
                     "obj": obj,
-                    "id": obj_id,
+                    "id": obj_id,  # 本輪暫時 id
                     "vision_tform_obj": vision_tform_obj,
                     "status": STATUS_DETECTED,
-                })
+                    "distance": distance,
+                }
+                self.detected_objects.append(detected)
+
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    best_obj = obj
+                    best_image_response = resp.image_response
+                    best_vision_tform_obj = vision_tform_obj
+                    best_detected = detected
+
+        # 掃描完後，更新target_list
+        self.merge_detected_targets(
+            detected_objects=self.detected_objects,
+            new_status=STATUS_DETECTED
+        )
+
+        # 再依距離統一更新 target 狀態
+        self.update_target_status()
+
+        # 將本輪暫時 id 對應到 global target_list 的 id，只有 pending 才回傳
+        if best_detected is not None:
+            best_target = self.find_matching_target(best_detected["vision_tform_obj"])
+            if best_target is not None and best_target.get("status") == STATUS_PENDING:
+                best_target_id = best_target["id"]
+                return best_obj, best_image_response, best_vision_tform_obj, best_target_id
+
+        return None, None, None, None
 
     # ---------------------------------------------------------
     # 更新全局 target_list，5 cm 去重
     # ---------------------------------------------------------
-    def update_target_list(self, detected_objects=None, new_status=STATUS_DETECTED):
+    def merge_detected_targets(self, detected_objects=None, new_status=STATUS_DETECTED):
         if detected_objects is None:
             detected_objects = self.detected_objects
 
@@ -561,7 +521,9 @@ class SpotFetchROS2Node(Node):
 
         for detected in detected_objects:
             new_tform = detected["vision_tform_obj"]
-            matched_index = None
+
+            best_match_index = None
+            best_match_distance = math.inf
 
             for i, target in enumerate(self.target_list):
                 old_tform = target["vision_tform_obj"]
@@ -571,37 +533,15 @@ class SpotFetchROS2Node(Node):
                 dz = new_tform.z - old_tform.z
                 distance = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-                if distance <= self.duplicate_threshold:
-                    matched_index = i
-                    break
+                if distance <= self.duplicate_threshold and distance < best_match_distance:
+                    best_match_distance = distance
+                    best_match_index = i
 
-            if matched_index is not None:
-                self.target_list[matched_index]["obj"] = detected["obj"]
-                self.target_list[matched_index]["vision_tform_obj"] = detected["vision_tform_obj"]
+            if best_match_index is not None:
+                self.target_list[best_match_index]["obj"] = detected["obj"]
+                self.target_list[best_match_index]["vision_tform_obj"] = detected["vision_tform_obj"]
 
-                old_status = self.target_list[matched_index].get("status", STATUS_DETECTED)
-                if old_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
-                    pass
-        
-                elif old_status == STATUS_GRASPING:
-                    if new_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
-                        self.target_list[matched_index]["status"] = new_status
-
-                elif old_status == STATUS_PENDING:
-                    if new_status in [
-                        STATUS_DETECTED,
-                        STATUS_GRASPING,
-                        STATUS_GRASPED,
-                        STATUS_UNHANDLED,
-                    ]:
-                        self.target_list[matched_index]["status"] = new_status
-                elif old_status == STATUS_APPROACHING:
-                    self.target_list[matched_index]["status"] = new_status
-
-                else:
-                    self.target_list[matched_index]["status"] = new_status
-
-                updated_targets.append(self.target_list[matched_index])
+                updated_targets.append(self.target_list[best_match_index])
 
             else:
                 target_id = f"target_{self.next_target_id}"
@@ -618,33 +558,19 @@ class SpotFetchROS2Node(Node):
 
         return updated_targets
     # ---------------------------------------------------------
-    # 搜尋全局 target_list 中最近的目標 (只考慮xy不考慮z)
+    # 計算target_list所有target與spot的距離，找出最近的target，並根據距離更新狀態(不參與的狀態: grasped, unhandled)
     # ---------------------------------------------------------
-    def find_nearest_target(self):
+    def update_target_status(self):
         if len(self.target_list) == 0:
-            return None, None, None
+            return
 
         nearest_target = None
-        nearest_pose_in_body = None
         nearest_distance = math.inf
-
-        # ---------------------------------------------------------
-        # 第一優先：pending
-        # 第二優先：detected / approaching
-        # grasping / grasped / unhandled 都不參與搜尋
-        # ---------------------------------------------------------
-        has_pending = any(
-            target.get("status") == STATUS_PENDING
-            for target in self.target_list
-        )
-
-        if has_pending:
-            candidate_status = [STATUS_PENDING]
-        else:
-            candidate_status = [STATUS_DETECTED, STATUS_APPROACHING]
+        has_pending = False
 
         for target in self.target_list:
-            if target.get("status") not in candidate_status:
+            # 不參與距離計算的狀態
+            if target.get("status") in [STATUS_GRASPING, STATUS_GRASPED, STATUS_UNHANDLED]:
                 continue
 
             tform = target["vision_tform_obj"]
@@ -672,116 +598,28 @@ class SpotFetchROS2Node(Node):
                 x = pose_in_body.pose.position.x
                 y = pose_in_body.pose.position.y
 
-                # 只算平面距離
+                # 只算 2D 平面距離
                 distance = math.sqrt(x * x + y * y)
 
             except Exception as e:
                 self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
                 continue
 
+            # 先根據距離更新狀態
+            if distance <= 1.5:
+                target["status"] = STATUS_PENDING
+                has_pending = True
+            else:
+                target["status"] = STATUS_DETECTED
+
+            # 記錄最近 target，只有在沒有 pending 時才會用到
             if distance < nearest_distance:
                 nearest_distance = distance
                 nearest_target = target
-                nearest_pose_in_body = pose_in_body
 
-        if nearest_target is None:
-            return None, None, None
-
-        # ---------------------------------------------------------
-        # 狀態整理
-        # ---------------------------------------------------------
-        if candidate_status == [STATUS_PENDING]:
-            # 有 pending 時，所有舊 approaching 都降回 detected
-            for target in self.target_list:
-                if target.get("status") == STATUS_APPROACHING:
-                    target["status"] = STATUS_DETECTED
-            # pending 保持不變
-        else:
-            # 沒有 pending 時，才維持遠距離接近邏輯
-            for target in self.target_list:
-                if target.get("status") in [STATUS_DETECTED, STATUS_APPROACHING]:
-                    if target["id"] == nearest_target["id"]:
-                        target["status"] = STATUS_APPROACHING
-                    else:
-                        target["status"] = STATUS_DETECTED
-
-        return nearest_target, nearest_pose_in_body, nearest_distance
-    # ---------------------------------------------------------
-    # 發布 RViz marker
-    # ---------------------------------------------------------
-    def publish_target_markers(self):
-        marker_array = MarkerArray()
-
-        # 先刪除舊 marker
-        delete_marker = Marker()
-        delete_marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-        delete_marker.header.stamp = self.get_clock().now().to_msg()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-
-        for i, target in enumerate(self.target_list):
-            tform = target["vision_tform_obj"]
-
-            # 球體 marker
-            marker = Marker()
-            marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "detected_targets"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-
-            marker.pose.position.x = float(tform.x)
-            marker.pose.position.y = float(tform.y)
-            marker.pose.position.z = float(tform.z)
-
-            marker.pose.orientation.x = 0.0
-            marker.pose.orientation.y = 0.0
-            marker.pose.orientation.z = 0.0
-            marker.pose.orientation.w = 1.0
-
-            marker.scale.x = 0.08
-            marker.scale.y = 0.08
-            marker.scale.z = 0.08
-
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-
-            marker.lifetime.sec = 0
-            marker_array.markers.append(marker)
-
-            # 文字 marker
-            text_marker = Marker()
-            text_marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-            text_marker.header.stamp = self.get_clock().now().to_msg()
-            text_marker.ns = "detected_target_labels"
-            text_marker.id = 1000 + i
-            text_marker.type = Marker.TEXT_VIEW_FACING
-            text_marker.action = Marker.ADD
-
-            text_marker.pose.position.x = float(tform.x)
-            text_marker.pose.position.y = float(tform.y)
-            text_marker.pose.position.z = float(tform.z) + 0.12
-
-            text_marker.pose.orientation.x = 0.0
-            text_marker.pose.orientation.y = 0.0
-            text_marker.pose.orientation.z = 0.0
-            text_marker.pose.orientation.w = 1.0
-
-            text_marker.scale.z = 0.08
-
-            text_marker.color.a = 1.0
-            text_marker.color.r = 1.0
-            text_marker.color.g = 1.0
-            text_marker.color.b = 1.0
-
-            text_marker.text = target["id"]
-            text_marker.lifetime.sec = 0
-            marker_array.markers.append(text_marker)
-
-        self.marker_pub.publish(marker_array)
+        # 如果沒有任何 pending，才把最近的設成 approaching
+        if not has_pending and nearest_target is not None:
+            nearest_target["status"] = STATUS_APPROACHING
 
     def find_center_px(self, polygon):
         min_x = math.inf
@@ -808,6 +646,24 @@ class SpotFetchROS2Node(Node):
             if target["id"] == target_id:
                 return target
         return None
+    
+    def find_matching_target(self, vision_tform_obj):
+        best_target = None
+        best_distance = math.inf
+
+        for target in self.target_list:
+            old_tform = target["vision_tform_obj"]
+
+            dx = vision_tform_obj.x - old_tform.x
+            dy = vision_tform_obj.y - old_tform.y
+            dz = vision_tform_obj.z - old_tform.z
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            if distance <= self.duplicate_threshold and distance < best_distance:
+                best_distance = distance
+                best_target = target
+
+        return best_target
 
 def main(args=None):
     rclpy.init(args=args)
