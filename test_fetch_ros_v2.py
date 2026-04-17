@@ -566,10 +566,8 @@ class SpotFetchROS2Node(Node):
 
         nearest_target = None
         nearest_distance = math.inf
-        has_pending = False
 
         for target in self.target_list:
-            # 不參與距離計算的狀態
             if target.get("status") in [STATUS_GRASPING, STATUS_GRASPED, STATUS_UNHANDLED]:
                 continue
 
@@ -597,28 +595,23 @@ class SpotFetchROS2Node(Node):
 
                 x = pose_in_body.pose.position.x
                 y = pose_in_body.pose.position.y
-
-                # 只算 2D 平面距離
                 distance = math.sqrt(x * x + y * y)
 
             except Exception as e:
                 self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
                 continue
 
-            # 先根據距離更新狀態
             if distance <= 1.5:
                 target["status"] = STATUS_PENDING
-                has_pending = True
             else:
                 target["status"] = STATUS_DETECTED
 
-            # 記錄最近 target，只有在沒有 pending 時才會用到
             if distance < nearest_distance:
                 nearest_distance = distance
                 nearest_target = target
 
-        # 如果沒有任何 pending，才把最近的設成 approaching
-        if not has_pending and nearest_target is not None:
+        # 只有最近目標原本不是 pending，才標成 approaching
+        if nearest_target is not None and nearest_target.get("status") != STATUS_PENDING:
             nearest_target["status"] = STATUS_APPROACHING
 
     def find_center_px(self, polygon):
