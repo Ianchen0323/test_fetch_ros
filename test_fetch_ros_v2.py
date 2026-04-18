@@ -22,10 +22,10 @@ import time
 
 # ros2
 import tf2_ros
+import tf2_geometry_msgs
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
-from visualization_msgs.msg import Marker, MarkerArray
 
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 
@@ -41,9 +41,18 @@ STATUS_UNHANDLED   = "unhandled"
 class SpotFetchROS2Node(Node):
     def __init__(self):
         super().__init__('spot_fetch_ros2_node')
-        
+
+        self.action_group = ReentrantCallbackGroup()
+        self._manip_result_future = None
+
         # --- 1. ROS 2 設定 ---
-        self.manip_client = ActionClient(self, Manipulation, '/manipulation')
+        # self.manip_client = ActionClient(self, Manipulation, '/manipulation')
+        self.manip_client = ActionClient(
+            self, 
+            Manipulation, 
+            '/manipulation',
+            callback_group=self.action_group  # 明確指定
+        )
         self.robot_client = ActionClient(self, RobotCommand, '/robot_command')
         
         # --- 2. SDK 設定 (不要求 Lease) ---
@@ -99,6 +108,10 @@ class SpotFetchROS2Node(Node):
         # 發布最終給 Spot 的控制速度
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
+       # 狀態變數
+        self.current_vx = 0.0
+        self.current_vy = 0.0
+        self.current_vrot = 0.0 
 
         # ----------------------- detection / target list -------------------------------
         self.detection_round = 0
@@ -106,7 +119,6 @@ class SpotFetchROS2Node(Node):
         self.target_list = []        # 全局清單
         self.next_target_id = 0
         self.current_grasp_target_id = None
-
 
         # ----------------------- TF ---------------------------------------------------
         self.tf_buffer = tf2_ros.Buffer()
@@ -333,6 +345,8 @@ def fetch_loop(self):
         result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
+        # 進入後先清除引用
+        self._manip_result_future = None
         status = future.result().status
         target = self.get_target_by_id(self.current_grasp_target_id)
 
@@ -345,14 +359,16 @@ def fetch_loop(self):
 
             action_thread = threading.Thread(target=self.post_grasp_sequence)
             action_thread.start()
+
+        elif status == 6: # ABORTED
+            self.get_logger().error('❌ 夾取被中止 (ABORTED)。通常是影像跟丟或位置不好，準備重試...')
+            if target is not None:
+                target["status"] = STATUS_PENDING # 讓它有機會被 fetch_loop 重新選中
+            
+            self.current_grasp_target_id = None
+            self.is_fetching = False # 釋放鎖定，讓機器人可以重新移動對準
         else:
             self.get_logger().error(f'❌ 夾取失敗，狀態碼: {status}')
-
-            # 失敗時先退回 pending，之後可再重試
-            if target is not None and target.get("status") != STATUS_GRASPED:
-                target["status"] = STATUS_PENDING
-
-            self.current_grasp_target_id = None
             self.is_fetching = False
         
     def post_grasp_sequence(self):
