@@ -346,7 +346,6 @@ class SpotFetchROS2Node(Node):
         result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        # 進入後先清除引用
         self._manip_result_future = None
         status = future.result().status
         target = self.get_target_by_id(self.current_grasp_target_id)
@@ -354,23 +353,20 @@ class SpotFetchROS2Node(Node):
         if status == 4:
             self.get_logger().info('✅ 夾取動作確認成功！')
 
-            # 夾取成功後，將目標狀態改成 grasped
             if target is not None:
                 target["status"] = STATUS_GRASPED
+                target["fail_count"] = 0
 
             action_thread = threading.Thread(target=self.post_grasp_sequence)
             action_thread.start()
 
-        elif status == 6: # ABORTED
+        elif status == 6:  # ABORTED
             self.get_logger().error('❌ 夾取被中止 (ABORTED)。通常是影像跟丟或位置不好，準備重試...')
-            if target is not None:
-                target["status"] = STATUS_PENDING # 讓它有機會被 fetch_loop 重新選中
-            
-            self.current_grasp_target_id = None
-            self.is_fetching = False # 釋放鎖定，讓機器人可以重新移動對準
+            self.handle_grasp_failure(target)
+
         else:
             self.get_logger().error(f'❌ 夾取失敗，狀態碼: {status}')
-            self.is_fetching = False
+            self.handle_grasp_failure(target)
         
     def post_grasp_sequence(self):
         self.send_cmd_blocking(RobotCommandBuilder.arm_ready_command(), "手臂預備 (Ready)")
@@ -575,6 +571,7 @@ class SpotFetchROS2Node(Node):
                     "status": new_status,
                     "pose_in_body": None,
                     "last_time": None,
+                    "fail_count": 0,
                 }
                 self.target_list.append(new_target)
                 updated_targets.append(new_target)
@@ -695,6 +692,29 @@ class SpotFetchROS2Node(Node):
                 best_target = target
 
         return best_target
+    
+    def handle_grasp_failure(self, target):
+        if target is None:
+            self.current_grasp_target_id = None
+            self.is_fetching = False
+            return
+
+        fail_count = target.get("fail_count", 0) + 1
+        target["fail_count"] = fail_count
+
+        if fail_count > 5:
+            target["status"] = STATUS_UNHANDLED
+            self.get_logger().warn(
+                f"目標 {target['id']} 夾取失敗超過 5 次，設為 UNHANDLED"
+            )
+        else:
+            target["status"] = STATUS_PENDING
+            self.get_logger().warn(
+                f"目標 {target['id']} 夾取失敗，第 {fail_count} 次，退回 PENDING"
+            )
+
+        self.current_grasp_target_id = None
+        self.is_fetching = False
 
 def main(args=None):
     rclpy.init(args=args)
