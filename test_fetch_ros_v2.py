@@ -67,6 +67,9 @@ class SpotFetchROS2Node(Node):
 
         # 去重門檻：5 cm
         self.duplicate_threshold = 0.2
+
+        # tf失敗後的狀態維持時間
+        self.tf_cache_timeout_sec = 2.0
         
         # 啟動主迴圈計時器
         self.is_fetching = False
@@ -124,141 +127,142 @@ class SpotFetchROS2Node(Node):
             # 讓 fetch_loop 控制速度就好，避免頻率衝突
             pass
     
-    def fetch_loop(self):
-        if self.is_fetching:
+def fetch_loop(self):
+    if self.is_fetching:
+        return
+
+    self.get_logger().info('正在透過 NCS 搜尋物體...')
+
+    target_obj, image_full, vision_tform_obj, target_id = self.detection_obj_and_img(
+        ['frontleft_fisheye_image', 'frontright_fisheye_image']
+    )
+
+    if len(self.target_list) == 0:
+        if self.is_approaching:
+            self.get_logger().info("target_list 為空，恢復巡邏模式...")
+            self.is_approaching = False
+        return
+
+    if target_id is not None:
+        self.get_logger().info("已有 pending 目標，開始進入夾取模式...")
+        self.is_approaching = False
+
+        if target_obj is None or vision_tform_obj is None:
+            self.get_logger().warn("進入夾取模式，但 detection_obj_and_img() 沒有取得有效目標")
             return
 
-        self.get_logger().info('正在透過 NCS 搜尋物體...')
+        self.get_logger().info("已抵達目標範圍，開始夾取程序...")
+        self.is_fetching = True
+        self.current_grasp_target_id = target_id
 
-        # 1. 掃描所有看到的目標，並在函式內完成：
-        #    merge_detected_targets() + update_target_status()
-        target_obj, image_full, vision_tform_obj, target_id = self.detection_obj_and_img(
-            ['frontleft_fisheye_image', 'frontright_fisheye_image']
+        center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
+
+        pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
+        grasp = manipulation_api_pb2.PickObjectInImage(
+            pixel_xy=pick_vec,
+            transforms_snapshot_for_camera=image_full.shot.transforms_snapshot,
+            frame_name_image_sensor=image_full.shot.frame_name_image_sensor,
+            camera_model=image_full.source.pinhole
+        )
+        grasp.grasp_params.grasp_palm_to_fingertip = 0.6
+        grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+
+        manip_request = manipulation_api_pb2.ManipulationApiRequest(
+            pick_object_in_image=grasp
         )
 
-        # 2. 若沒有任何目標，恢復巡邏
-        if len(self.target_list) == 0:
-            if self.is_approaching:
-                self.get_logger().info("target_list 為空，恢復巡邏模式...")
-                self.is_approaching = False
-            return
+        self.send_ros2_manipulation_goal(manip_request)
+        return
 
-        # 3. 若 target_id 非 None，代表已有 pending 目標，可優先進入夾取
-        if target_id is not None:
-            self.get_logger().info("已有 pending 目標，開始進入夾取模式...")
-            self.is_approaching = False
+    approaching_target = None
+    approaching_pose_in_body = None
+    approaching_distance = None
+    now_sec = self.get_clock().now().nanoseconds / 1e9
 
-            if target_obj is None or vision_tform_obj is None:
-                self.get_logger().warn("進入夾取模式，但 detection_obj_and_img() 沒有取得有效目標")
-                return
+    for target in self.target_list:
+        if target.get("status") != STATUS_APPROACHING:
+            continue
 
-            self.get_logger().info("已抵達目標範圍，開始夾取程序...")
-            self.is_fetching = True
-            self.current_grasp_target_id = target_id
+        tform = target["vision_tform_obj"]
+        pose_in_body = None
+        distance = None
 
-            # 計算像素中心
-            center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
+        try:
+            pose_in_vision = PoseStamped()
+            pose_in_vision.header.stamp = self.get_clock().now().to_msg()
+            pose_in_vision.header.frame_id = frame_helpers.VISION_FRAME_NAME
 
-            # 構造 SDK 夾取指令
-            pick_vec = geometry_pb2.Vec2(x=center_px_x, y=center_px_y)
-            grasp = manipulation_api_pb2.PickObjectInImage(
-                pixel_xy=pick_vec,
-                transforms_snapshot_for_camera=image_full.shot.transforms_snapshot,
-                frame_name_image_sensor=image_full.shot.frame_name_image_sensor,
-                camera_model=image_full.source.pinhole
-            )
-            grasp.grasp_params.grasp_palm_to_fingertip = 0.6
-            grasp.grasp_params.grasp_params_frame_name = frame_helpers.VISION_FRAME_NAME
+            pose_in_vision.pose.position.x = float(tform.x)
+            pose_in_vision.pose.position.y = float(tform.y)
+            pose_in_vision.pose.position.z = float(tform.z)
 
-            manip_request = manipulation_api_pb2.ManipulationApiRequest(
-                pick_object_in_image=grasp
+            pose_in_vision.pose.orientation.x = 0.0
+            pose_in_vision.pose.orientation.y = 0.0
+            pose_in_vision.pose.orientation.z = 0.0
+            pose_in_vision.pose.orientation.w = 1.0
+
+            pose_in_body = self.tf_buffer.transform(
+                pose_in_vision,
+                frame_helpers.BODY_FRAME_NAME,
+                timeout=Duration(seconds=0.2)
             )
 
-            # --- 將 SDK 夾取指令轉換並傳送給 ROS 2 ---
-            self.send_ros2_manipulation_goal(manip_request)
-            return
+            # TF 成功：更新 pose_in_body / last_time
+            target["pose_in_body"] = pose_in_body
+            target["last_time"] = now_sec
 
-        # 4. 若沒有 pending，再找目前 target_list 中是否有 approaching 目標
-        approaching_target = None
-        approaching_pose_in_body = None
-        approaching_distance = None
+            x = pose_in_body.pose.position.x
+            y = pose_in_body.pose.position.y
+            distance = math.sqrt(x * x + y * y)
 
-        for target in self.target_list:
-            if target.get("status") != STATUS_APPROACHING:
-                continue
+        except Exception as e:
+            cached_pose = target.get("pose_in_body", None)
+            last_time = target.get("last_time", None)
 
-            tform = target["vision_tform_obj"]
-
-            try:
-                pose_in_vision = PoseStamped()
-                pose_in_vision.header.stamp = self.get_clock().now().to_msg()
-                pose_in_vision.header.frame_id = frame_helpers.VISION_FRAME_NAME
-
-                pose_in_vision.pose.position.x = float(tform.x)
-                pose_in_vision.pose.position.y = float(tform.y)
-                pose_in_vision.pose.position.z = float(tform.z)
-
-                pose_in_vision.pose.orientation.x = 0.0
-                pose_in_vision.pose.orientation.y = 0.0
-                pose_in_vision.pose.orientation.z = 0.0
-                pose_in_vision.pose.orientation.w = 1.0
-
-                pose_in_body = self.tf_buffer.transform(
-                    pose_in_vision,
-                    frame_helpers.BODY_FRAME_NAME,
-                    timeout=Duration(seconds=0.2)
-                )
-
+            # TF 失敗：若舊 pose_in_body 還夠新，就沿用做移動
+            if cached_pose is not None and last_time is not None and (now_sec - last_time) < self.tf_cache_timeout_sec:
+                pose_in_body = cached_pose
                 x = pose_in_body.pose.position.x
                 y = pose_in_body.pose.position.y
                 distance = math.sqrt(x * x + y * y)
-
-            except Exception as e:
-                self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
+            else:
                 continue
 
-            approaching_target = target
-            approaching_pose_in_body = pose_in_body
-            approaching_distance = distance
-            break
+        approaching_target = target
+        approaching_pose_in_body = pose_in_body
+        approaching_distance = distance
+        break
 
-        # 5. 若有 approaching，執行接近
-        if approaching_target is not None:
-            self.is_approaching = True
+    if approaching_target is not None:
+        self.is_approaching = True
 
-            tx = approaching_pose_in_body.pose.position.x
-            ty = approaching_pose_in_body.pose.position.y
-            angle_to_target = math.atan2(ty, tx)
+        tx = approaching_pose_in_body.pose.position.x
+        ty = approaching_pose_in_body.pose.position.y
+        angle_to_target = math.atan2(ty, tx)
 
-            self.get_logger().info(
-                f"目前接近目標: {approaching_target['id']}，"
-                f"body x={tx:.2f}, y={ty:.2f}, 距離={approaching_distance:.2f}m"
-            )
+        self.get_logger().info(
+            f"目前接近目標: {approaching_target['id']}，"
+            f"body x={tx:.2f}, y={ty:.2f}, 距離={approaching_distance:.2f}m"
+        )
 
-            self.move_msg = Twist()
+        self.move_msg = Twist()
 
-            # 角度很大：先以轉向為主
-            if abs(angle_to_target) > 1.2:
-                self.move_msg.linear.x = 0.0
-                self.move_msg.angular.z = angle_to_target * 0.6
+        if abs(angle_to_target) > 1.2:
+            self.move_msg.linear.x = 0.0
+            self.move_msg.angular.z = angle_to_target * 0.6
+        elif abs(angle_to_target) > 0.5:
+            self.move_msg.linear.x = 0.12
+            self.move_msg.angular.z = angle_to_target * 0.6
+        else:
+            self.move_msg.linear.x = 0.3
+            self.move_msg.angular.z = angle_to_target * 0.5
 
-            # 中等角度：慢速前進，邊轉邊走
-            elif abs(angle_to_target) > 0.5:
-                self.move_msg.linear.x = 0.12
-                self.move_msg.angular.z = angle_to_target * 0.6
+        self.cmd_vel_pub.publish(self.move_msg)
+        return
 
-            # 小角度：正常靠近
-            else:
-                self.move_msg.linear.x = 0.3
-                self.move_msg.angular.z = angle_to_target * 0.5
-
-            self.cmd_vel_pub.publish(self.move_msg)
-            return
-
-        # 6. 其餘情況：沒有 approaching，也沒有 pending 可抓，恢復巡邏
-        if self.is_approaching:
-            self.get_logger().info("目前沒有 approaching / pending 目標，恢復巡邏模式...")
-            self.is_approaching = False
+    if self.is_approaching:
+        self.get_logger().info("目前沒有 approaching / pending 目標，恢復巡邏模式...")
+        self.is_approaching = False
 
     def send_cmd_async(self, sdk_cmd, label):
         """非同步發送：發完指令就直接回傳，不等待結果"""
@@ -552,13 +556,15 @@ class SpotFetchROS2Node(Node):
                     "id": target_id,
                     "vision_tform_obj": detected["vision_tform_obj"],
                     "status": new_status,
+                    "pose_in_body": None,
+                    "last_time": None,
                 }
                 self.target_list.append(new_target)
                 updated_targets.append(new_target)
 
         return updated_targets
     # ---------------------------------------------------------
-    # 計算target_list所有target與spot的距離，找出最近的target，並根據距離更新狀態(不參與的狀態: grasped, unhandled)
+
     # ---------------------------------------------------------
     def update_target_status(self):
         if len(self.target_list) == 0:
@@ -566,12 +572,15 @@ class SpotFetchROS2Node(Node):
 
         nearest_target = None
         nearest_distance = math.inf
+        now_sec = self.get_clock().now().nanoseconds / 1e9
 
         for target in self.target_list:
             if target.get("status") in [STATUS_GRASPING, STATUS_GRASPED, STATUS_UNHANDLED]:
                 continue
 
             tform = target["vision_tform_obj"]
+            pose_in_body = None
+            distance = None
 
             try:
                 pose_in_vision = PoseStamped()
@@ -593,13 +602,26 @@ class SpotFetchROS2Node(Node):
                     timeout=Duration(seconds=0.2)
                 )
 
+                # TF 成功：更新 pose_in_body / last_time
+                target["pose_in_body"] = pose_in_body
+                target["last_time"] = now_sec
+
                 x = pose_in_body.pose.position.x
                 y = pose_in_body.pose.position.y
                 distance = math.sqrt(x * x + y * y)
 
             except Exception as e:
-                self.get_logger().warn(f"目標 {target['id']} TF 轉換失敗: {e}")
-                continue
+                cached_pose = target.get("pose_in_body", None)
+                last_time = target.get("last_time", None)
+
+                # TF 失敗：若舊 pose_in_body 還夠新，就沿用
+                if cached_pose is not None and last_time is not None and (now_sec - last_time) < self.tf_cache_timeout_sec:
+                    pose_in_body = cached_pose
+                    x = pose_in_body.pose.position.x
+                    y = pose_in_body.pose.position.y
+                    distance = math.sqrt(x * x + y * y)
+                else:
+                    continue
 
             if distance <= 1.5:
                 target["status"] = STATUS_PENDING
@@ -610,7 +632,6 @@ class SpotFetchROS2Node(Node):
                 nearest_distance = distance
                 nearest_target = target
 
-        # 只有最近目標原本不是 pending，才標成 approaching
         if nearest_target is not None and nearest_target.get("status") != STATUS_PENDING:
             nearest_target["status"] = STATUS_APPROACHING
 
