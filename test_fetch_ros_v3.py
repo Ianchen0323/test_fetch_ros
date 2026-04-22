@@ -2,17 +2,17 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
+
 import math
-# import cv2
-# import numpy as np
-from google.protobuf import wrappers_pb2
 
 # Boston Dynamics SDK (僅用於視覺與資料處理，不搶 Lease)
 import bosdyn.client
+import bosdyn.client.util
 from bosdyn.api import geometry_pb2, image_pb2, manipulation_api_pb2, network_compute_bridge_pb2
 from bosdyn.client import frame_helpers
-from bosdyn.client.network_compute_bridge_client import NetworkComputeBridgeClient
+from bosdyn.client.network_compute_bridge_client import (ExternalServerError, NetworkComputeBridgeClient)
 from bosdyn.client.robot_command import RobotCommandBuilder
+
 
 # ROS 2 轉換與 Action 訊息
 from bosdyn_msgs.conversions import convert
@@ -33,8 +33,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 
 # ----------------------- status 定義 -------------------------------------------
-STATUS_DETECTED    = "detected"
-STATUS_PENDING     = "pending"
+STATUS_DETECTED    = "detected"             # 被偵測到並去重後的目標
+STATUS_PENDING     = "pending"              
 STATUS_APPROACHING = "approaching"
 STATUS_GRASPING    = "grasping"
 STATUS_GRASPED     = "grasped"
@@ -107,13 +107,7 @@ class SpotFetchROS2Node(Node):
         # 發布最終給 Spot 的控制速度
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        # 狀態變數
-        self.current_vx = 0.0
-        self.current_vy = 0.0
-        self.current_vrot = 0.0
-
         # ----------------------- detection / target list -------------------------------
-        self.detection_round = 0
         self.detected_objects = []   # 本輪清單
         self.target_list = []        # 全局清單
         self.next_target_id = 0
@@ -152,8 +146,11 @@ class SpotFetchROS2Node(Node):
             ['frontleft_fisheye_image', 'frontright_fisheye_image']
         )
 
-        # 2. 更新全局 target_list（5 cm 去重）
-        self.update_target_list()
+        # 2. 對每輪新增的 detected_objects 進行去重和合併，更新加入到全局 target_list
+        self.merge_detected_targets(
+            detected_objects=self.detected_objects,
+            new_status=STATUS_DETECTED
+        )
 
         # 3. 發布到 RViz
         self.publish_target_markers()
@@ -478,24 +475,6 @@ class SpotFetchROS2Node(Node):
                 if vision_tform_obj is None:
                     continue
 
-                # try:
-                #     vision_tform_body = frame_helpers.get_a_tform_b(
-                #         resp.image_response.shot.transforms_snapshot,
-                #         frame_helpers.VISION_FRAME_NAME,
-                #         frame_helpers.BODY_FRAME_NAME
-                #     )
-
-                #     body_tform_obj = vision_tform_body.inverse() * vision_tform_obj
-
-                #     tx = body_tform_obj.x
-                #     ty = body_tform_obj.y
-                #     distance = math.sqrt(tx ** 2 + ty ** 2)
-                # except Exception as e:
-                #     self.get_logger().warn(f'距離計算失敗 ({source}): {e}')
-                #     continue
-
-                # if distance > 2:
-                #     continue
                 # --- 核心邏輯修改：對比 NCS 偵測點與當前 Target 點的距離 ---
                 ox = vision_tform_obj.x
                 oy = vision_tform_obj.y
@@ -521,27 +500,6 @@ class SpotFetchROS2Node(Node):
                     best_vision_tform_obj = vision_tform_obj
                     best_target_id = nearest_target["id"]
 
-                # close_detected = [{
-                #     "obj": obj,
-                #     "vision_tform_obj": vision_tform_obj,
-                #     "status": STATUS_PENDING
-                # }]
-
-                # updated_targets = self.update_target_list(
-                #     detected_objects=close_detected,
-                #     new_status=STATUS_PENDING
-                # )
-
-                # if len(updated_targets) > 0:
-                #     target = updated_targets[0]
-
-                #     if distance < nearest_distance:
-                #         nearest_distance = distance
-                #         best_obj = obj
-                #         best_image_response = resp.image_response
-                #         best_vision_tform_obj = vision_tform_obj
-                #         best_target_id = target["id"]
-
         if best_obj is None:
             return None, None, None, None
 
@@ -551,15 +509,8 @@ class SpotFetchROS2Node(Node):
     # 多目標掃描函式
     # ---------------------------------------------------------
     def detection_obj_and_img(self, image_sources):
-        # 每輪清單初始化
-        self.detection_round += 1
-        round_id = self.detection_round
-
-        # 清空本輪候選物件
+        # 重置本輪偵測清單
         self.detected_objects = []
-
-        # 同一輪內的物件編號
-        obj_index_in_round = 0
 
         for source in image_sources:
             img_src = network_compute_bridge_pb2.ImageSourceAndService(
@@ -581,45 +532,42 @@ class SpotFetchROS2Node(Node):
 
             try:
                 resp = self.ncb_client.network_compute_bridge_command(process_img_req)
-            except Exception as e:
+            except ExternalServerError:
                 self.get_logger().error(f'NCS 連線錯誤 ({source}): {e}')
                 continue
 
-            if len(resp.object_in_image) == 0:
-                continue
+            if len(resp.object_in_image) > 0:
+                for obj in resp.object_in_image:
 
-            for obj in resp.object_in_image:
-                obj_label = obj.name.split('_label_')[-1]
-                if obj_label != self.target_label:
-                    continue
+                    obj_label = obj.name.split('_label_')[-1]   
+                    if obj_label != self.target_label:
+                        # 不是我們要找的目標，忽略它
+                        # 如果有多類別需求，可以在這裡擴充對其他 label 的處理邏輯
+                        continue
 
-                try:
-                    vision_tform_obj = frame_helpers.get_a_tform_b(
-                        obj.transforms_snapshot,
-                        frame_helpers.VISION_FRAME_NAME,
-                        obj.image_properties.frame_name_image_coordinates
-                    )
-                except Exception:
-                    vision_tform_obj = None
+                    try:
+                        vision_tform_obj = frame_helpers.get_a_tform_b(
+                            obj.transforms_snapshot,
+                            frame_helpers.VISION_FRAME_NAME,
+                            obj.image_properties.frame_name_image_coordinates
+                        )
+                    except bosdyn.client.frame_helpers.ValidateFrameTreeError:
+                        vision_tform_obj = None
 
-                if vision_tform_obj is None:
-                    continue
+                    if vision_tform_obj is None:
+                        continue
 
-                suffix = chr(ord('a') + obj_index_in_round)
-                obj_id = f"{round_id}{suffix}"
-                obj_index_in_round += 1
-
-                self.detected_objects.append({
-                    "obj": obj,
-                    "id": obj_id,
-                    "vision_tform_obj": vision_tform_obj,
-                    "status": STATUS_DETECTED,
-                })
+                    self.detected_objects.append({
+                        "obj": obj,
+                        "vision_tform_obj": vision_tform_obj,
+                        "status": STATUS_DETECTED,
+                    })
 
     # ---------------------------------------------------------
-    # 更新全局 target_list，5 cm 去重
+    # merge_detected_targets:對每輪新增的 detected_objects 進行去重和合併，更新全局 target_list
     # ---------------------------------------------------------
-    def update_target_list(self, detected_objects=None, new_status=STATUS_DETECTED):
+    def merge_detected_targets(self, detected_objects=None, new_status=STATUS_DETECTED):
+
         if detected_objects is None:
             detected_objects = self.detected_objects
 
@@ -627,48 +575,32 @@ class SpotFetchROS2Node(Node):
 
         for detected in detected_objects:
             new_tform = detected["vision_tform_obj"]
-            matched_index = None
+
+            best_match_index = None
+            best_match_distance = math.inf
 
             for i, target in enumerate(self.target_list):
+                # 設定不更新的狀態集合{grasped, unhandled}
+                if target.get("status") in [STATUS_GRASPED, STATUS_UNHANDLED]:
+                    continue
+                # 取得 target_list中每個目標的vision_tform_obj
                 old_tform = target["vision_tform_obj"]
-
+                # 計算新舊目標的距離(3D距離)
                 dx = new_tform.x - old_tform.x
                 dy = new_tform.y - old_tform.y
                 dz = new_tform.z - old_tform.z
                 distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+                # 如果小於重複門檻(duplicate_threshold)和目前最佳距離(best_match_distance)，則更新數值
+                if distance <= self.duplicate_threshold and distance < best_match_distance:
+                    best_match_distance = distance
+                    best_match_index = i
+            # 匹配到的話就更新目標資料(obj, vision_tform_obj)不調整status
+            if best_match_index is not None:
+                self.target_list[best_match_index]["obj"] = detected["obj"]
+                self.target_list[best_match_index]["vision_tform_obj"] = detected["vision_tform_obj"]
 
-                if distance <= self.duplicate_threshold:
-                    matched_index = i
-                    break
-
-            if matched_index is not None:
-                self.target_list[matched_index]["obj"] = detected["obj"]
-                self.target_list[matched_index]["vision_tform_obj"] = detected["vision_tform_obj"]
-
-                old_status = self.target_list[matched_index].get("status", STATUS_DETECTED)
-                if old_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
-                    pass
-        
-                elif old_status == STATUS_GRASPING:
-                    if new_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
-                        self.target_list[matched_index]["status"] = new_status
-
-                elif old_status == STATUS_PENDING:
-                    if new_status in [
-                        STATUS_DETECTED,
-                        STATUS_GRASPING,
-                        STATUS_GRASPED,
-                        STATUS_UNHANDLED,
-                    ]:
-                        self.target_list[matched_index]["status"] = new_status
-                elif old_status == STATUS_APPROACHING:
-                    self.target_list[matched_index]["status"] = new_status
-
-                else:
-                    self.target_list[matched_index]["status"] = new_status
-
-                updated_targets.append(self.target_list[matched_index])
-
+                updated_targets.append(self.target_list[best_match_index])
+            # 無匹配到的話就新增一筆目標資料，並給予新的ID和狀態(detected)
             else:
                 target_id = f"target_{self.next_target_id}"
                 self.next_target_id += 1
@@ -683,6 +615,70 @@ class SpotFetchROS2Node(Node):
                 updated_targets.append(new_target)
 
         return updated_targets
+    # def update_target_list(self, detected_objects=None, new_status=STATUS_DETECTED):
+    #     if detected_objects is None:
+    #         detected_objects = self.detected_objects
+
+    #     updated_targets = []
+
+    #     for detected in detected_objects:
+    #         new_tform = detected["vision_tform_obj"]
+    #         matched_index = None
+
+    #         for i, target in enumerate(self.target_list):
+    #             old_tform = target["vision_tform_obj"]
+
+    #             dx = new_tform.x - old_tform.x
+    #             dy = new_tform.y - old_tform.y
+    #             dz = new_tform.z - old_tform.z
+    #             distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    #             if distance <= self.duplicate_threshold:
+    #                 matched_index = i
+    #                 break
+
+    #         if matched_index is not None:
+    #             self.target_list[matched_index]["obj"] = detected["obj"]
+    #             self.target_list[matched_index]["vision_tform_obj"] = detected["vision_tform_obj"]
+
+    #             old_status = self.target_list[matched_index].get("status", STATUS_DETECTED)
+    #             if old_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
+    #                 pass
+        
+    #             elif old_status == STATUS_GRASPING:
+    #                 if new_status in [STATUS_GRASPED, STATUS_UNHANDLED]:
+    #                     self.target_list[matched_index]["status"] = new_status
+
+    #             elif old_status == STATUS_PENDING:
+    #                 if new_status in [
+    #                     STATUS_DETECTED,
+    #                     STATUS_GRASPING,
+    #                     STATUS_GRASPED,
+    #                     STATUS_UNHANDLED,
+    #                 ]:
+    #                     self.target_list[matched_index]["status"] = new_status
+    #             elif old_status == STATUS_APPROACHING:
+    #                 self.target_list[matched_index]["status"] = new_status
+
+    #             else:
+    #                 self.target_list[matched_index]["status"] = new_status
+
+    #             updated_targets.append(self.target_list[matched_index])
+
+    #         else:
+    #             target_id = f"target_{self.next_target_id}"
+    #             self.next_target_id += 1
+
+    #             new_target = {
+    #                 "obj": detected["obj"],
+    #                 "id": target_id,
+    #                 "vision_tform_obj": detected["vision_tform_obj"],
+    #                 "status": new_status,
+    #             }
+    #             self.target_list.append(new_target)
+    #             updated_targets.append(new_target)
+
+    #     return updated_targets
     # ---------------------------------------------------------
     # 搜尋全局 target_list 中最近的目標 (只考慮xy不考慮z)
     # ---------------------------------------------------------
@@ -774,82 +770,6 @@ class SpotFetchROS2Node(Node):
                         target["status"] = STATUS_DETECTED
 
         return nearest_target, nearest_pose_in_body, nearest_distance
-    # ---------------------------------------------------------
-    # 發布 RViz marker
-    # ---------------------------------------------------------
-    def publish_target_markers(self):
-        marker_array = MarkerArray()
-
-        # 先刪除舊 marker
-        delete_marker = Marker()
-        delete_marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-        delete_marker.header.stamp = self.get_clock().now().to_msg()
-        delete_marker.action = Marker.DELETEALL
-        marker_array.markers.append(delete_marker)
-
-        for i, target in enumerate(self.target_list):
-            tform = target["vision_tform_obj"]
-
-            # 球體 marker
-            marker = Marker()
-            marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "detected_targets"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-
-            marker.pose.position.x = float(tform.x)
-            marker.pose.position.y = float(tform.y)
-            marker.pose.position.z = float(tform.z)
-
-            marker.pose.orientation.x = 0.0
-            marker.pose.orientation.y = 0.0
-            marker.pose.orientation.z = 0.0
-            marker.pose.orientation.w = 1.0
-
-            marker.scale.x = 0.08
-            marker.scale.y = 0.08
-            marker.scale.z = 0.08
-
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-
-            marker.lifetime.sec = 0
-            marker_array.markers.append(marker)
-
-            # 文字 marker
-            text_marker = Marker()
-            text_marker.header.frame_id = frame_helpers.VISION_FRAME_NAME
-            text_marker.header.stamp = self.get_clock().now().to_msg()
-            text_marker.ns = "detected_target_labels"
-            text_marker.id = 1000 + i
-            text_marker.type = Marker.TEXT_VIEW_FACING
-            text_marker.action = Marker.ADD
-
-            text_marker.pose.position.x = float(tform.x)
-            text_marker.pose.position.y = float(tform.y)
-            text_marker.pose.position.z = float(tform.z) + 0.12
-
-            text_marker.pose.orientation.x = 0.0
-            text_marker.pose.orientation.y = 0.0
-            text_marker.pose.orientation.z = 0.0
-            text_marker.pose.orientation.w = 1.0
-
-            text_marker.scale.z = 0.08
-
-            text_marker.color.a = 1.0
-            text_marker.color.r = 1.0
-            text_marker.color.g = 1.0
-            text_marker.color.b = 1.0
-
-            text_marker.text = target["id"]
-            text_marker.lifetime.sec = 0
-            marker_array.markers.append(text_marker)
-
-        self.marker_pub.publish(marker_array)
 
     def find_center_px(self, polygon):
         min_x = math.inf
