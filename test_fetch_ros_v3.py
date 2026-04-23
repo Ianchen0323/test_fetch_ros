@@ -37,7 +37,6 @@ ImageSources = [
 # ----------------------- status 定義 -------------------------------------------
 STATUS_DETECTED    = "detected"             # 被偵測到並去重後的目標
 STATUS_PENDING     = "pending"              
-STATUS_APPROACHING = "approaching"
 STATUS_GRASPING    = "grasping"
 STATUS_GRASPED     = "grasped"
 STATUS_UNHANDLED   = "unhandled"
@@ -227,10 +226,10 @@ class SpotFetchROS2Node(Node):
         if 'fail_count' not in nearest_target:
             nearest_target['fail_count'] = 0
         
-        target_obj, image_full, vision_tform_obj, best_target_id = self.get_obj_and_img(
+        target_obj, image_full, vision_tform_obj, target_id = self.get_obj_and_img(
             ImageSources, nearest_target
         )
-
+        # 7.1 如果無法從 NCS 或 TF 取得有效的目標資訊，則增加失敗計數並嘗試重新接近
         if target_obj is None or vision_tform_obj is None:
             nearest_target['fail_count'] += 1
             self.get_logger().warn(
@@ -245,11 +244,11 @@ class SpotFetchROS2Node(Node):
             return
 
         nearest_target['fail_count'] = 0
+        #------------------------------------------------------------------------------------------
         self.get_logger().info("已抵達目標範圍，開始夾取程序...")
         self.is_approaching = False
         self.is_fetching = True
-        self.current_grasp_target_id = best_target_id
-        #------------------------------------------------------------------------------------------
+        self.current_grasp_target_id = target_id
 
         # 計算像素中心
         center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
@@ -315,8 +314,15 @@ class SpotFetchROS2Node(Node):
         convert(manip_request, goal_msg.command)
 
         self.get_logger().info('正在發送 ROS 2 夾取指令...')
-        send_goal_future = self.manip_client.send_goal_async(goal_msg)
+        send_goal_future = self.manip_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.manip_feedback_callback
+        )
         send_goal_future.add_done_callback(self.goal_response_callback)
+    #測試ros2 action client 的反饋機制
+    def manip_feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().info(f'[Manip Feedback Raw] {feedback}')    
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
@@ -422,11 +428,12 @@ class SpotFetchROS2Node(Node):
     # ---------------------------------------------------------
     def get_obj_and_img(self, image_sources, nearest_target):
         best_obj = None
+        best_target_id = None
         best_image_response = None
         best_vision_tform_obj = None
-        # nearest_distance = math.inf
+        
         min_offset = math.inf # 改為記錄與目標的最小偏移
-        best_target_id = None
+        
 
         target_pos = nearest_target['vision_tform_obj']
         
@@ -450,7 +457,7 @@ class SpotFetchROS2Node(Node):
 
             try:
                 resp = self.ncb_client.network_compute_bridge_command(process_img_req)
-            except Exception as e:
+            except ExternalServerError as e:
                 self.get_logger().error(f'NCS 連線錯誤 ({source}): {e}')
                 continue
 
@@ -468,7 +475,7 @@ class SpotFetchROS2Node(Node):
                         frame_helpers.VISION_FRAME_NAME,
                         obj.image_properties.frame_name_image_coordinates
                     )
-                except Exception:
+                except bosdyn.client.frame_helpers.ValidateFrameTreeError as e:
                     vision_tform_obj = None
 
                 if vision_tform_obj is None:
@@ -486,12 +493,9 @@ class SpotFetchROS2Node(Node):
                     (oz - target_pos.z)**2
                 )
 
-                # 如果偵測點與原本目標距離超過 0.1m，視為路人甲
-                if offset > 0.15:
+                if offset > self.duplicate_threshold:
                     continue
 
-                # --- 只要在 0.1m 內，我們就認為它是我們要找的目標 ---
-                # 這裡不呼叫 update_target_list，避免在夾取模式下一直產生新 ID
                 if offset < min_offset:
                     min_offset = offset
                     best_obj = obj
@@ -531,7 +535,7 @@ class SpotFetchROS2Node(Node):
 
             try:
                 resp = self.ncb_client.network_compute_bridge_command(process_img_req)
-            except ExternalServerError:
+            except ExternalServerError as e:
                 self.get_logger().error(f'NCS 連線錯誤 ({source}): {e}')
                 continue
 
@@ -550,7 +554,7 @@ class SpotFetchROS2Node(Node):
                             frame_helpers.VISION_FRAME_NAME,
                             obj.image_properties.frame_name_image_coordinates
                         )
-                    except bosdyn.client.frame_helpers.ValidateFrameTreeError:
+                    except bosdyn.client.frame_helpers.ValidateFrameTreeError as e:
                         vision_tform_obj = None
 
                     if vision_tform_obj is None:
@@ -687,7 +691,7 @@ class SpotFetchROS2Node(Node):
     # --------------------------------------------------------------------------------------------------------
     def find_nearest_target(self):
         if len(self.target_list) == 0:
-            return None, None, None
+            return None
 
         nearest_target = None
         nearest_distance = math.inf
