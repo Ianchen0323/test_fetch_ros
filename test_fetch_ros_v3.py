@@ -2,8 +2,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
-
 import math
+import time
+import threading
 
 # Boston Dynamics SDK (僅用於視覺與資料處理，不搶 Lease)
 import bosdyn.client
@@ -12,15 +13,12 @@ from bosdyn.api import geometry_pb2, image_pb2, manipulation_api_pb2, network_co
 from bosdyn.client import frame_helpers
 from bosdyn.client.network_compute_bridge_client import (ExternalServerError, NetworkComputeBridgeClient)
 from bosdyn.client.robot_command import RobotCommandBuilder
-
+from bosdyn.client.robot_state import RobotStateClient
 
 # ROS 2 轉換與 Action 訊息
 from bosdyn_msgs.conversions import convert
 from spot_msgs.action import Manipulation
 from spot_msgs.action import RobotCommand
-
-import threading
-import time
 
 # ros2
 import tf2_ros
@@ -36,11 +34,13 @@ ImageSources = [
     'frontleft_fisheye_image', 'frontright_fisheye_image'
 ]
 # ----------------------- status 定義 -------------------------------------------
-STATUS_DETECTED    = "detected"             # 被偵測到並去重後的目標
-STATUS_PENDING     = "pending"              
-STATUS_GRASPING    = "grasping"
-STATUS_GRASPED     = "grasped"
-STATUS_UNHANDLED   = "unhandled"
+STATUS_DETECTED    = "detected"      # 偵測狀態
+STATUS_APPROACHING = "approaching"   # 移動狀態
+STATUS_SELECTED    = "selected"      # 選定狀態 
+STATUS_GRASPING    = "grasping"      # 夾取狀態
+STATUS_POST_GRASP  = "post_grasp"    # 放置狀態
+STATUS_GRASPED     = "grasped"       # 完成狀態
+STATUS_UNHANDLED   = "unhandled"     # 完成狀態
 
 
 class SpotFetchROS2Node(Node):
@@ -70,27 +70,26 @@ class SpotFetchROS2Node(Node):
         self.robot = sdk.create_robot("192.168.80.3")
         self.robot.authenticate("admin", "eqyqp33u8i74")
         self.robot.time_sync.wait_for_sync()
+        self.robot_state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
         self.ncb_client = self.robot.ensure_client(NetworkComputeBridgeClient.default_service_name)
         
         # --- 3. 任務參數 ---
-        self.ml_service = "fetch-server"       # TODO: 填入你的服務名稱
-        self.model_name = "best.engine"        # TODO: 填入你的模型名稱
-        self.target_label = "Bottle_and_Can"   # TODO: 你要找的標籤
-        self.min_confidence = 0.5
+        self.ml_service     = "fetch-server"       # TODO: 填入你的服務名稱
+        self.model_name     = "best.engine"        # TODO: 填入你的模型名稱
+        self.target_label   = "Bottle_and_Can"   # TODO: 你要找的標籤
 
-        # 固定參數
-        self.duplicate_threshold = 0.2
-        self.tf_timeout_threshold = 10.0
-        self.pending_threshold = 1.5
+        # --- 4. 啟動主迴圈計時器 --- 
+        self.move_msg       = Twist()
+
+        # --- 5. 固定參數 ---
+        self.min_confidence         = 0.5
+        self.duplicate_threshold    = 0.2
+        self.tf_timeout_threshold   = 10.0
+        self.distance_threshold     = 1.5
         
-        # 啟動主迴圈計時器
-        self.is_fetching = False
-        self.is_approaching = False
-        self.move_msg = Twist()
-
-        # 建立一個並行群組
-        self.nav_group = ReentrantCallbackGroup()
-        self.timer_group = MutuallyExclusiveCallbackGroup()
+        # --- 6. 建立一個並行群組 ---
+        self.nav_group      = ReentrantCallbackGroup()
+        self.timer_group    = MutuallyExclusiveCallbackGroup()
         
         # ----------------------- communication --------------------------------------------------
         
@@ -106,26 +105,24 @@ class SpotFetchROS2Node(Node):
             callback_group=self.timer_group
         )
         
-        # # 訂閱 nav 速度指令
-        # self.nav_sub = self.create_subscription(Twist, 'cmd_vel_nav', self.nav_callback, 10)
         # 發布最終給 Spot 的控制速度
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
 
         # ----------------------- detection / target list -------------------------------
-        self.detected_objects = []   # 本輪清單
-        self.target_list = []        # 全局清單
-        self.next_target_id = 0
-        self.current_grasp_target_id = None
+        self.detected_objects   = []   # 本輪清單
+        self.target_list        = []   # 全局清單
+        self.next_target_id     = 0
+        self.current_target_id  = None
 
         # ----------------------- TF ---------------------------------------------------
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.current_manip_cmd_id = None
+        self.tf_buffer      = tf2_ros.Buffer()
+        self.tf_listener    = tf2_ros.TransformListener(self.tf_buffer, self)
         # ----------------------- Feedback 參數 -----------------------------------------
-        self.current_manip_state = None
-        self.last_manip_feedback_time = None
-        self.last_logged_manip_state = None
-        self.manip_terminal_handled = False   # 避免成功/失敗被重複處理
+        self.current_goal_handle = None 
+        self._manip_result_future = None
+        self.last_feedback_state = None
+        self.state_start_time = None
+        self.state_timeout_duration = 5.0  # 設定超時秒數
         # -------------------------------------------------------------------------------
 
     def nav_callback(self, msg):
@@ -133,9 +130,12 @@ class SpotFetchROS2Node(Node):
         核心邏輯：如果沒在夾東西，就把導航的速度直接『搬運』給 Spot。
         如果正在夾東西，則不轉發（或者發布 0,0,0 確保靜止）。
         """
-        if not self.is_fetching and not self.is_approaching:
+        has_approaching = self.has_target_with_status(STATUS_APPROACHING)
+        has_fetching = self.has_target_with_status([ STATUS_SELECTED, STATUS_GRASPING, STATUS_POST_GRASP ])
+
+        if not has_fetching and not has_approaching:
             self.cmd_vel_pub.publish(msg)
-        elif self.is_approaching:
+        elif has_approaching:
             self.cmd_vel_pub.publish(self.move_msg)
         else:
             # 如果正在處理物品，我們不主動發布 0，
@@ -143,7 +143,7 @@ class SpotFetchROS2Node(Node):
             pass
     
     def fetch_loop(self):
-        if self.is_fetching:
+        if self.has_target_with_status([STATUS_SELECTED, STATUS_GRASPING, STATUS_POST_GRASP]):
             return
         
         self.get_logger().info('正在透過 NCS 搜尋物體...')
@@ -160,27 +160,27 @@ class SpotFetchROS2Node(Node):
         # 3. 更新 target_list 中每個目標的狀態
         self.update_target_status()
 
-        # 4. 若沒有任何目標，恢復巡邏 (走coverage_path)
+        # 4. 若沒有目標，恢復巡邏 (走coverage_path)
         if len(self.target_list) == 0:
-            if self.is_approaching:
                 self.get_logger().info("target_list 為空，恢復巡邏模式...")
-                self.is_approaching = False
-            return
+                return
 
         # 5. 從 target_list 中找最近目標
         nearest_target = self.find_nearest_target()
-        # 5.1 印出 target_list 狀態供除錯用
+        # 5.1 如果最近目標沒有有效的距離或位置資訊，則跳過並繼續巡邏
+        if nearest_target is None or nearest_target['pose_in_body'] is None or nearest_target['distance'] is None:
+            self.get_logger().info("找不到有效最近目標，恢復巡邏模式...")
+            return
+
+        if nearest_target["status"] == STATUS_DETECTED:
+            nearest_target["status"] = STATUS_APPROACHING
+
+        # 5.2 印出 target_list 狀態供除錯用
         self.get_logger().info("=== target_list ===")
         for target in self.target_list:
             self.get_logger().info(f"{target['id']}, {target['status']}")
-        # 5.2 如果最近目標沒有有效的距離或位置資訊，則跳過並繼續巡邏
-        if nearest_target is None or nearest_target['pose_in_body'] is None or nearest_target['distance'] is None:
-            self.get_logger().info("找不到有效最近目標，恢復巡邏模式...")
-            self.is_approaching = False
-            return
         
         # 6. 如果有有效的最近目標，進入接近模式
-        self.is_approaching = True
         self.get_logger().info(
             f"目前最近目標: {nearest_target['id']}，狀態: {nearest_target['status']}，距離: {nearest_target['distance']:.2f}m"
         )
@@ -188,13 +188,15 @@ class SpotFetchROS2Node(Node):
         tx = nearest_target['pose_in_body'].pose.position.x
         ty = nearest_target['pose_in_body'].pose.position.y
         angle_to_target = math.atan2(ty, tx)
+        #-------------------------------------------------------------------------------------------
+        #局部規劃移動邏輯：
         # 6.1 如果角度太大 (> 70度)，先原地轉向對齊
         if abs(angle_to_target) > 1.2:
             self.move_msg.linear.x = 0.0
             self.move_msg.angular.z = angle_to_target * 0.6
             return
         # 6.2 若最近目標還大於 1.5m，就接近最近目標
-        elif nearest_target['distance'] > self.pending_threshold:
+        elif nearest_target['distance'] > self.distance_threshold:
             self.get_logger().info(
                 f"目前最近目標: {nearest_target['id']}，"
                 f"body x={tx:.2f}, y={ty:.2f}, 距離={nearest_target['distance']:.2f}m"
@@ -222,39 +224,39 @@ class SpotFetchROS2Node(Node):
             self.move_msg.linear.x = 0.0
             self.move_msg.angular.z = angle_to_target * 0.6 # 慢速微調
             return # 繼續微調，不往下執行夾取
-        
-
+        #-------------------------------------------------------------------------------------------
         # 7. 進入夾取模式
         self.get_logger().info("最近目標已進入 1.5m 範圍，開始進入夾取模式...")
         self.move_msg.linear.x = 0.0
         self.move_msg.angular.z = 0.0
-
-        if 'fail_count' not in nearest_target:
-            nearest_target['fail_count'] = 0
+        time.sleep(1.0)
         
         target_obj, image_full, vision_tform_obj, target_id = self.get_obj_and_img(
             ImageSources, nearest_target
         )
         # 7.1 如果無法從 NCS 或 TF 取得有效的目標資訊，則增加失敗計數並嘗試重新接近
-        if target_obj is None or vision_tform_obj is None:
+        if target_obj is None or vision_tform_obj is None or image_full is None:
             nearest_target['fail_count'] += 1
             self.get_logger().warn(
-                f"無法辨識目標 {nearest_target['id']} (第 {nearest_target['fail_count']}/5 次嘗試)"
+                f"無法辨識目標 {nearest_target['id']} "
+                f"(第 {nearest_target['fail_count']}/5 次嘗試)"
             )
+
             if nearest_target['fail_count'] >= 5:
-                self.get_logger().error(f"❌ 目標 {nearest_target['id']} 連續 5 次辨識失敗，標記為 UNHANDLED")
+                self.get_logger().error(
+                    f"目標 {nearest_target['id']} 連續 5 次辨識失敗，標記為 UNHANDLED"
+                )
                 nearest_target['status'] = STATUS_UNHANDLED
-                # 也可以選擇在這裡把 is_fetching/is_approaching 重置，讓它去找下一個
-                self.is_fetching = False
-                self.is_approaching = False
+            else:
+                nearest_target['status'] = STATUS_DETECTED
+
             return
 
         nearest_target['fail_count'] = 0
+        nearest_target["status"] = STATUS_SELECTED
+        self.current_target_id = target_id
         #------------------------------------------------------------------------------------------
         self.get_logger().info("已抵達目標範圍，開始夾取程序...")
-        self.is_approaching = False
-        self.is_fetching = True
-        self.current_grasp_target_id = target_id
 
         # 計算像素中心
         center_px_x, center_px_y = self.find_center_px(target_obj.image_properties.coordinates)
@@ -284,6 +286,15 @@ class SpotFetchROS2Node(Node):
         self.get_logger().info(f'發布指令: {label}')
         self.robot_client.send_goal_async(goal_msg) # 不加 callback，不等待
     
+    def is_robot_busy(self):
+        """檢查目前是否有指令正在 Action Server 執行中"""
+        if hasattr(self, 'current_goal_handle') and self.current_goal_handle is not None:
+            # 如果 goal_handle 存在，且狀態是在 ACCEPTED 或 EXECUTING (通常 status < 4)
+            status = self.current_goal_handle.status
+            # GoalStatus.STATUS_ACCEPTED = 1, STATUS_EXECUTING = 2
+            return status in [1, 2]
+        return False
+        
     def send_cmd_blocking(self, sdk_cmd, label):
         """同步阻塞式發送：確保前一個動作完成才回傳"""
         if not self.robot_client.wait_for_server(timeout_sec=5.0):
@@ -293,36 +304,39 @@ class SpotFetchROS2Node(Node):
         goal_msg = RobotCommand.Goal()
         convert(sdk_cmd, goal_msg.command)
         
-        self.get_logger().info(f'▶執行步驟: {label}')
+        if self.is_robot_busy():
+            self.get_logger().warn(f'偵測到前一個指令尚未結束，正在等待或取消...')
+            # 選項 A: 強制取消 (如果你想插隊)
+            # self.current_goal_handle.cancel_goal_async()
+            
+            # 選項 B: 阻塞直到結束 (如果你想排隊)
+            while self.is_robot_busy():
+                time.sleep(0.1)
         
         send_goal_future = self.robot_client.send_goal_async(goal_msg)
         while rclpy.ok() and not send_goal_future.done():
             time.sleep(0.1)
             
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
+        self.current_goal_handle = send_goal_future.result()
+        if not self.current_goal_handle.accepted:
             self.get_logger().error(f'{label} 被機器人拒絕')
             return False
 
-        result_future = goal_handle.get_result_async()
+        result_future = self.current_goal_handle.get_result_async()
         while rclpy.ok() and not result_future.done():
             time.sleep(0.1)
         self.get_logger().info(f'{label} 完成')
         return True
+    
     # 建立發送action server
     def send_ros2_manipulation_goal(self, manip_request):
+        target = self.get_target_by_id(self.current_target_id)
+
         if not self.manip_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("找不到 Manipulation Action Server!")
-            self.is_fetching = False
+            target['status'] = STATUS_DETECTED
             return
-
-        # 每次新任務前重設追蹤狀態
-        self.current_manip_cmd_id = None
-        self.current_manip_state = None
-        self.last_manip_feedback_time = None
-        self.last_logged_manip_state = None
-        self.manip_terminal_handled = False
-
+        
         goal_msg = Manipulation.Goal()
         convert(manip_request, goal_msg.command)
 
@@ -332,140 +346,190 @@ class SpotFetchROS2Node(Node):
             feedback_callback=self.manip_feedback_callback
         )
         send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def manip_feedback_callback(self, feedback_msg):
+        # self.get_logger().info(f"回饋物件內容: {dir(feedback_msg.feedback.feedback)}")
+        valid_states = [2, 3, 6, 10, 12]
+        state_code = feedback_msg.feedback.feedback.current_state.value
+        now = time.time() # 或者使用 self.get_clock().now()
+        # self.get_logger().info(f"==> 夾取進度回饋: 狀態碼 {state_code}")
+        # --- 狀態卡死檢查邏輯 ---
+        if state_code != self.last_feedback_state:
+            # 狀態改變了，重置計時器
+            self.last_feedback_state = state_code
+            self.state_start_time = now
+        else:
+            # 狀態沒變，檢查是否超時
+            if self.state_start_time is not None:
+                elapsed = now - self.state_start_time
+                if elapsed > self.state_timeout_duration and state_code != 3:
+                    self.get_logger().error(f"❌ 夾取狀態卡在 {state_code} 超過 {self.state_timeout_duration} 秒，判定失敗。")
+                    self.state_start_time = now
+                    self.cancel_current_manipulation()
+        
+        if state_code not in valid_states:
+            self.get_logger().error(f"❌ 偵測到異常狀態碼 {state_code}，判定夾取失敗。")
+            self.state_start_time = now
+            self.cancel_current_manipulation()
+
+    def cancel_current_manipulation(self):
+        """封裝取消動作的輔助函式"""
+        if hasattr(self, 'current_goal_handle') and self.current_goal_handle is not None:
+            self.current_goal_handle.cancel_goal_async()
+            self.get_logger().warn("已發送取消 Action 請求")
+            self.current_goal_handle = None # 清除 handle 防止重複呼叫
+
+        self.last_feedback_state = None
+        self.state_start_time = None
+        
+        # 重置目標物狀態，讓它能被重新偵測
+        target = self.get_target_by_id(self.current_target_id)
+        if target:
+            target["status"] = STATUS_DETECTED
+            
+        action_thread = threading.Thread(target=self.post_grasp_sequence, args=(False,))
+        action_thread.start()
+        return # 結束此 callback
+    
     #檢查 action 發送是否成功
     def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
+        self.current_goal_handle = future.result()
+        if not self.current_goal_handle.accepted:
             self.get_logger().error('夾取請求被拒絕！')
 
-            target = self.get_target_by_id(self.current_grasp_target_id)
-            if target is not None and target.get("status") != STATUS_GRASPED:
-                target["status"] = STATUS_PENDING
-
-            self.current_grasp_target_id = None
-            self.is_fetching = False
+            target = self.get_target_by_id(self.current_target_id)
+            if target is not None and target.get("status") not in [STATUS_POST_GRASP, STATUS_GRASPED]:
+                target["status"] = STATUS_DETECTED
+            self.current_target_id = None
             return
 
         # action server 已接受，這時才設成 grasping
-        target = self.get_target_by_id(self.current_grasp_target_id)
+        target = self.get_target_by_id(self.current_target_id)
         if target is not None:
             target["status"] = STATUS_GRASPING
 
         self.get_logger().info('夾取請求已接受，執行中...')
-        self._manip_result_future = goal_handle.get_result_async()
-        self._manip_result_future.add_done_callback(self.get_result_callback)
-    # 對 action 持續監聽狀態
-    def manip_feedback_callback(self, feedback_msg):
-        fb = feedback_msg.feedback.feedback
-        state = fb.current_state.value
+        result_future = self.current_goal_handle.get_result_async()
+        result_future.add_done_callback(self.get_result_callback)
 
-        self.current_manip_cmd_id = fb.manipulation_cmd_id
-        self.current_manip_state = state
-        self.last_manip_feedback_time = self.get_clock().now()
-
-        state_name = self.manip_state_to_string(state)
-
-        # 只在狀態變化時印出
-        if state != self.last_logged_manip_state:
-            self.get_logger().info(
-                f"[Manip Feedback] cmd_id={self.current_manip_cmd_id}, "
-                f"state={state} ({state_name})"
-            )
-            self.last_logged_manip_state = state
-
-        # 已經處理過 terminal state，就不要重複處理
-        if self.manip_terminal_handled:
-            return
-
-        success_state = manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
-
-        failed_states = [
-            manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
-            manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
-            manipulation_api_pb2.MANIP_STATE_GRASP_FAILED_TO_RAYCAST_INTO_MAP,
-            manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_WAITING_DATA_AT_EDGE
-        ]
-
-        if state == success_state:
-            self.handle_manip_success()
-
-        elif state in failed_states:
-            self.handle_manip_failure(reason=state_name)
     # action 結束的檢查       
     def get_result_callback(self, future):
-        self._manip_result_future = None
+        status = future.result().status
+        target = self.get_target_by_id(self.current_target_id)
 
-        try:
-            status = future.result().status
-        except Exception as e:
-            self.get_logger().error(f"取得 manipulation result 失敗: {e}")
-            if not self.manip_terminal_handled:
-                self.handle_manip_failure(reason="RESULT_EXCEPTION")
-            return
-
-        # feedback 已經處理過 terminal state，就直接結束
-        if self.manip_terminal_handled:
-            self.get_logger().info(f"[Manip Result] action status={status}, 已由 feedback 處理")
-            return
-
-        # feedback 沒處理到，才用 action result 當備援
         if status == 4:
-            self.handle_manip_success()
-        elif status == 6:
-            self.handle_manip_failure(reason="ACTION_ABORTED")
-        else:
-            self.handle_manip_failure(reason=f"ACTION_STATUS_{status}")
+            self.get_logger().info('夾取動作確認成功！')
+            time.sleep(0.1)
+            robot_state = self.robot_state_client.get_robot_state()
+            
+            manip_state = robot_state.manipulator_state
+            # is_holding = manip_state.is_gripper_holding_item
+            open_percent = manip_state.gripper_open_percentage
+            if open_percent > 1.5:
+                is_holding = True
+            else:
+                is_holding = False
+                
+            if not is_holding:
+                self.get_logger().warn(f"❌ 動作完成但未偵測到物體 (夾空)，開合度: {open_percent}%")
+                # test = input("請按 Enter 繼續...")
+                action_thread = threading.Thread(target=self.post_grasp_sequence, args=(is_holding,))
+                action_thread.start()
+                return
+            
+            self.get_logger().info(f"✅ 確認夾持成功！開合度: {open_percent}%")
+            
+            # test = input("請按 Enter 繼續...")
+            # 夾取成功後，將目標狀態改成 POST_GRASP 完成夾取準備放置
+            if target is not None:
+                target["status"] = STATUS_POST_GRASP
+
+            action_thread = threading.Thread(target=self.post_grasp_sequence, args=(is_holding,))
+            action_thread.start()
 
         
-    def post_grasp_sequence(self):
-        self.send_cmd_blocking(RobotCommandBuilder.arm_ready_command(), "手臂預備 (Ready)")
-        
-        try:
-            final_joints = [3.103, -1.219, 0.732, 0.013, 1.826, 2.877]
+    def post_grasp_sequence(self, grasp_success):
+        target = self.get_target_by_id(self.current_target_id)
+        if grasp_success:
+            self.send_cmd_blocking(RobotCommandBuilder.arm_ready_command(), "手臂預備 (Ready)")
             
-            # --- 步驟 1: 高位轉向後方 ---
-            # 我們保留 sh0 (3.103)，但將 sh1 設為較高的角度 (例如 -0.5 或 -0.8)
-            # 這樣手臂會「舉著」轉到後面，不會掃到背上的設備
-            high_rotate_joints = [2.38, -1.719, 0.8, 0.0, 1.826, 2.877] 
-            
-            self.get_logger().info("執行步驟 1: 高位旋轉至後方...")
-            cmd1 = RobotCommandBuilder.arm_joint_command(*high_rotate_joints)
-            # self.send_cmd_blocking(cmd1, "高位旋轉")
-            self.send_cmd_async(cmd1, "高位旋轉")
-            time.sleep(0.9)
-            # --- 步驟 2: 下壓至最終目標點 ---
-            # 此時第一軸已經到位，垂直降落即可
-            self.get_logger().info("執行步驟 2: 下壓至背後安全點...")
-            cmd2 = RobotCommandBuilder.arm_joint_command(*final_joints, max_vel=20.0, 
-                max_accel=5.0)
-            self.send_cmd_blocking(cmd2, "垂直下壓到位")
-            
-            
+            try:
+                final_joints = [3.103, -1.219, 0.732, 0.013, 1.826, 2.877]
+                
+                # --- 步驟 1: 高位轉向後方 ---
+                # 我們保留 sh0 (3.103)，但將 sh1 設為較高的角度 (例如 -0.5 或 -0.8)
+                # 這樣手臂會「舉著」轉到後面，不會掃到背上的設備
+                high_rotate_joints = [2.38, -1.719, 0.8, 0.0, 1.826, 2.877] 
+                
+                self.get_logger().info("回收中")
+                cmd1 = RobotCommandBuilder.arm_joint_command(*high_rotate_joints)
+                self.send_cmd_async(cmd1, "高位旋轉")
+                time.sleep(0.9)
+                # --- 步驟 2: 下壓至最終目標點 ---
+                # 此時第一軸已經到位，垂直降落即可
+                # self.get_logger().info("執行步驟 2: 下壓至背後安全點...")
+                cmd2 = RobotCommandBuilder.arm_joint_command(*final_joints, max_vel=20.0, 
+                    max_accel=5.0)
+                self.send_cmd_blocking(cmd2, "垂直下壓到位")
+                
+                
+                self.send_cmd_blocking(
+                    RobotCommandBuilder.claw_gripper_open_fraction_command(1.0),
+                    "開啟夾爪"
+                )
+                time.sleep(0.7)
+
+                self.send_cmd_blocking(
+                    RobotCommandBuilder.arm_stow_command(),
+                    "手臂收納 (Stow)"
+                )
+                
+                self.send_cmd_blocking(
+                    RobotCommandBuilder.claw_gripper_open_fraction_command(0.0),
+                    "關閉夾爪"
+                )
+                time.sleep(0.2)
+                
+            except Exception as e:
+                self.get_logger().error(f"執行回收動作時出錯: {e}")
+            finally:
+                if target is not None:
+                    target["status"] = STATUS_UNHANDLED
+                self.current_target_id = None
+        else:
+            robot_state = self.robot_state_client.get_robot_state()
+            manip_state = robot_state.manipulator_state
+            stow_status = manip_state.stow_state
             self.send_cmd_blocking(
                 RobotCommandBuilder.claw_gripper_open_fraction_command(1.0),
                 "開啟夾爪"
             )
-            time.sleep(0.7)
-
+            self.send_cmd_blocking(RobotCommandBuilder.arm_ready_command(), "手臂預備 (Ready)")
+            # time.sleep(0.5)
+            # unstow_joint = [0.0, -2.728982, 2.626391, -0.003963, 0.184514, 0.002903]
+            # unstow_cmd = RobotCommandBuilder.arm_joint_command(*unstow_joint, max_vel=20.0, 
+            #     max_accel=5.0)
+            # self.send_cmd_blocking(unstow_cmd, "unstow")
+            # time.sleep(0.5)
             self.send_cmd_blocking(
                 RobotCommandBuilder.arm_stow_command(),
                 "手臂收納 (Stow)"
             )
-            
+            time.sleep(0.3)
+            robot_state = self.robot_state_client.get_robot_state()
+            manip_state = robot_state.manipulator_state
+            stow_status = manip_state.stow_state
+
             self.send_cmd_blocking(
-                RobotCommandBuilder.claw_gripper_open_fraction_command(0.0),
-                "關閉夾爪"
-            )
-            time.sleep(0.2)
-            
-        except Exception as e:
-            self.get_logger().error(f"執行回收動作時出錯: {e}")
-        finally:
-            self.is_fetching = False
-            self.current_grasp_target_id = None
+                    RobotCommandBuilder.claw_gripper_open_fraction_command(0.0),
+                    "關閉夾爪"
+                )
+
+            target["status"] = STATUS_GRASPED
+
 
     # ---------------------------------------------------------
-    # 單目標夾取用函式(只處理1.5m內的目標並且回傳最近的的目標)
+    # 夾取用辨識函式：從 NCS 偵測結果中找到與 nearest_target 最匹配的物體
     # ---------------------------------------------------------
     def get_obj_and_img(self, image_sources, nearest_target):
         best_obj = None
@@ -548,7 +612,6 @@ class SpotFetchROS2Node(Node):
             return None, None, None, None
 
         return best_obj, best_image_response, best_vision_tform_obj, best_target_id
-
     # --------------------------------------------------------------------------------------------------------
     # detection_obj_and_img:掃描所有影像來源，將符合條件的偵測結果加入 detected_objects 清單
     # --------------------------------------------------------------------------------------------------------
@@ -656,6 +719,8 @@ class SpotFetchROS2Node(Node):
                     "last_time": None,
                     "pose_in_body": None,
                     "distance": None,
+                    "fail_count": 0,
+                    "failure_reason": None,
                 }
                 self.target_list.append(new_target)
                 updated_targets.append(new_target)
@@ -669,11 +734,13 @@ class SpotFetchROS2Node(Node):
         if len(self.target_list) == 0:
             return
         # 取得 ROS 2 clock 的現在時間，並轉成秒
-        #now_sec = self.get_clock().now().nanoseconds / 1e9
+        now_sec = self.get_clock().now().nanoseconds / 1e9
 
         for target in self.target_list:
-            # 設定不更新狀態的狀態集合{grasping, grasped, unhandled}
-            if target.get("status") in [STATUS_GRASPING, STATUS_GRASPED, STATUS_UNHANDLED]:
+            # 設定不更新狀態的狀態集合
+            if target.get("status") in [
+                STATUS_SELECTED, STATUS_GRASPING, STATUS_POST_GRASP, STATUS_GRASPED, STATUS_UNHANDLED
+                ]:
                 continue
 
             tform = target["vision_tform_obj"]
@@ -709,52 +776,40 @@ class SpotFetchROS2Node(Node):
                 distance = math.sqrt(x * x + y * y)
                 target["distance"] = distance
 
-            except Exception as e:
+            except Exception :
                 cached_pose = target.get("pose_in_body", None)
                 last_time = target.get("last_time", None)
                 #TF 失敗：若舊 pose_in_body 還夠新，就沿用
-                if cached_pose is not None:
+                if cached_pose is not None and last_time is not None and (now_sec - last_time) < self.tf_timeout_threshold:
                     pose_in_body = cached_pose
                     x = pose_in_body.pose.position.x
                     y = pose_in_body.pose.position.y
                     distance = math.sqrt(x * x + y * y)
                     target["distance"] = distance
                 else:
-                    continue
-      
-            if distance <= self.pending_threshold:
-                target["status"] = STATUS_PENDING
-            else:
-                target["status"] = STATUS_DETECTED
+                    continue        
+
+
+            target["status"] = STATUS_DETECTED
     # --------------------------------------------------------------------------------------------------------
-    # find_nearest_target:搜尋全局 target_list 中最近的目標 (只考慮xy不考慮z)
+    # find_nearest_target:搜尋全局 target_list 中最近的目標
     # --------------------------------------------------------------------------------------------------------
     def find_nearest_target(self):
-        if len(self.target_list) == 0:
+        if not self.target_list:
             return None
+
+        candidates = self.get_targets_by_status([
+            STATUS_APPROACHING,
+            STATUS_DETECTED
+        ])
 
         nearest_target = None
         nearest_distance = math.inf
 
-        #判斷 target_list 中是否有 pending 狀態的目標
-        has_pending = any(
-            target.get("status") == STATUS_PENDING
-            for target in self.target_list
-        )
-        #如果有 pending 狀態的目標，就只考慮 pending 狀態的目標，否則就考慮 detected 狀態的目標
-        if has_pending:
-            candidate_status = [STATUS_PENDING]
-        else:
-            candidate_status = [STATUS_DETECTED]
+        for target in candidates:
+            distance = target.get("distance")
+            pose_in_body = target.get("pose_in_body")
 
-        for target in self.target_list:
-            if target.get("status") not in candidate_status:
-                continue
-            #如果沒有 pose_in_body 或 distance 回傳 None 就跳過
-            pose_in_body = target.get("pose_in_body", None)
-            distance = target.get("distance", None)
-
-            # 沒有快取資料就跳過
             if pose_in_body is None or distance is None:
                 continue
 
@@ -762,13 +817,10 @@ class SpotFetchROS2Node(Node):
                 nearest_distance = distance
                 nearest_target = target
 
-
-
-        if nearest_target is None:
-            return None
-
         return nearest_target
-
+    # ---------------------------------------------------------
+    # find_center_px:計算 NCS 偵測到的物體在影像中的像素中心點
+    # ---------------------------------------------------------
     def find_center_px(self, polygon):
         min_x = math.inf
         min_y = math.inf
@@ -787,77 +839,22 @@ class SpotFetchROS2Node(Node):
         y = math.fabs(max_y - min_y) / 2.0 + min_y
         return (x, y)
     # ---------------------------------------------------------
-    #根據id搜索 target_list 中的目標，回傳目標資料
+    # target_list 的管理函數
     # ---------------------------------------------------------
     def get_target_by_id(self, target_id):
         for target in self.target_list:
             if target["id"] == target_id:
                 return target
         return None
+
+    def get_targets_by_status(self, statuses):
+        if isinstance(statuses, str):
+            statuses = [statuses]
+        return [t for t in self.target_list if t.get("status") in statuses]
+
+    def has_target_with_status(self, statuses: list[str]):
+        return any(t.get("status") in statuses for t in self.target_list)
     # ---------------------------------------------------------        
-    #對feedback狀態碼的語意轉換
-    # ---------------------------------------------------------
-    def state_to_string(self, state):
-        mapping = {
-            0: "UNKNOWN",
-            1: "DONE",
-            2: "SEARCHING_FOR_GRASP",
-            3: "MOVING_TO_GRASP",
-            4: "GRASPING_OBJECT",
-            5: "PLACING_OBJECT",
-            6: "GRASP_SUCCEEDED",
-            7: "GRASP_FAILED",
-            8: "GRASP_PLANNING_NO_SOLUTION",
-            9: "GRASP_FAILED_TO_RAYCAST_INTO_MAP",
-            10: "WALKING_TO_OBJECT",
-            11: "GRASP_PLANNING_SUCCEEDED",
-            12: "ATTEMPTING_RAYCASTING",
-            13: "GRASP_PLANNING_WAITING_DATA_AT_EDGE",
-            14: "MOVING_TO_PLACE",
-            15: "PLACE_FAILED_TO_RAYCAST_INTO_MAP",
-            16: "PLACE_SUCCEEDED",
-            17: "PLACE_FAILED",
-        }
-        return mapping.get(state, f"UNKNOWN_STATE_{state}")
-    #回傳 success 後的處理函數
-    def handle_manip_success(self):
-        target = self.get_target_by_id(self.current_grasp_target_id)
-
-        if target is not None:
-            target["status"] = STATUS_GRASPED
-            target["fail_count"] = 0
-
-        self.manip_terminal_handled = True
-
-        self.get_logger().info("✅ feedback 判定抓取成功，執行 post_grasp_sequence")
-        action_thread = threading.Thread(target=self.post_grasp_sequence)
-        action_thread.start()
-    #回傳 fail 的處理函數
-    def handle_manip_failure(self, reason=""):
-        target = self.get_target_by_id(self.current_grasp_target_id)
-
-        if target is not None and target.get("status") != STATUS_GRASPED:
-            if 'fail_count' not in target:
-                target['fail_count'] = 0
-            target['fail_count'] += 1
-
-            self.get_logger().warn(
-                f"目標 {target['id']} 夾取失敗 ({reason})，"
-                f"fail_count={target['fail_count']}"
-            )
-
-            if target['fail_count'] >= 5:
-                target["status"] = STATUS_UNHANDLED
-                self.get_logger().error(
-                    f"目標 {target['id']} 連續失敗過多，標記為 UNHANDLED"
-                )
-            else:
-                target["status"] = STATUS_PENDING
-
-        self.current_grasp_target_id = None
-        self.is_fetching = False
-        self.is_approaching = False
-        self.manip_terminal_handled = True        
 
 def main(args=None):
     rclpy.init(args=args)
